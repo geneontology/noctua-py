@@ -1,0 +1,14 @@
+# Changes here will be overwritten by Copier
+_commit: 08e42af
+_src_path: monarch-project-copier
+copyright_year: '2025'
+email: my-name@my-org.org
+full_name: My Name
+gh_action_docs_preview: false
+github_handle: geneontology
+github_org: geneontology
+license: BSD-3-Clause
+project_description: TODO
+project_name: gocam-ai
+project_slug: gocam_ai
+
