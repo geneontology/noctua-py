@@ -43,6 +43,7 @@ from .barista import (
     BaristaClient,
     BaristaError,
 )
+from .session import SessionManager
 
 if TYPE_CHECKING:
     from .amigo import AmigoClient
@@ -57,6 +58,10 @@ app.add_typer(barista_app, name="barista")
 # Amigo sub-app
 amigo_app = typer.Typer(help="Amigo/GOlr query commands for searching GO annotations and bioentities")
 app.add_typer(amigo_app, name="amigo")
+
+# Session sub-app
+session_app = typer.Typer(help="Session management for persistent variable tracking")
+app.add_typer(session_app, name="session")
 
 
 def _make_client(
@@ -100,6 +105,38 @@ def _normalize_model_id(model_id: str) -> str:
         elif ":" not in model_id:
             return f"gomodel:{model_id}"
     return model_id
+
+
+def _resolve_session_variables(
+    session: Optional[str],
+    model_id: str,
+    **identifiers: str
+) -> tuple[Optional[SessionManager], Dict[str, str]]:
+    """Resolve multiple variables from session.
+
+    Args:
+        session: Session name (or None if no session)
+        model_id: Model ID for variable scoping
+        **identifiers: Named identifiers to resolve (e.g., subject="ras", object="raf")
+
+    Returns:
+        Tuple of (session_manager, resolved_dict)
+        resolved_dict maps identifier names to resolved values
+    """
+    if not session:
+        return None, identifiers
+
+    session_manager = SessionManager()
+    typer.echo(f"📂 Using session: {session}")
+
+    resolved = {}
+    for name, value in identifiers.items():
+        resolved_value = session_manager.get_variable(session, model_id, value) or value
+        if resolved_value != value:
+            typer.echo(f"  Resolved {name} '{value}' -> '{resolved_value}'")
+        resolved[name] = resolved_value
+
+    return session_manager, resolved
 
 
 def _print_dry_run(url: str, requests: List[dict], intention: str = "action", provided_by: Optional[str] = None) -> None:
@@ -172,6 +209,7 @@ def add_individual(
     class_curie: str = typer.Option(..., "--class", help="Class CURIE to instantiate (e.g., GO:0016055)"),
     assign: str = typer.Option("x1", "--assign", help="Assign-to-variable identifier"),
     validate: Optional[List[str]] = typer.Option(None, "--validate", help="Expected types (e.g., 'GO:0003924' or 'GO:0003924=GTPase activity')"),
+    session: Optional[str] = typer.Option(None, "--session", help="Session name for persistent variable tracking"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL (overrides --live flag)"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace (overrides --live flag)"),
@@ -195,6 +233,12 @@ def add_individual(
         noctua-py barista add-individual --model MODEL --class GO:0003924 --validate "GO:0003924=GTPase activity"
     """
     model = _normalize_model_id(model)
+
+    # Initialize session manager if session is specified
+    session_manager = SessionManager() if session else None
+    if session:
+        typer.echo(f"📂 Using session: {session}")
+
     req = BaristaClient.req_add_individual(model, class_curie, assign)
     if dry_run:
         # Determine URL for dry run display
@@ -220,8 +264,16 @@ def add_individual(
 
     client = _make_client(token, base_url, namespace, provided_by, live)
 
+    # Load session variables into client if session was already initialized
+    if session_manager and session:
+        # Load existing variables from session into client
+        session_manager.copy_variables_to_client(session, model, client)
+
     # Parse validation specs if provided
     expected_individuals = _parse_validation_spec(validate)
+
+    # Take snapshot for variable tracking
+    before_state = client._snapshot_model(model) if assign else None
 
     if expected_individuals:
         # Use validation-enabled execution
@@ -236,6 +288,22 @@ def add_individual(
         # Standard execution without validation
         resp = client.m3_batch([req])
 
+    # Handle variable tracking
+    if resp.ok and assign and before_state:
+        # Track the new individual
+        new_id = client._track_new_individual(model, before_state, resp, assign)
+
+        # Save variables to session if specified
+        if session_manager and session and new_id:
+            session_manager.set_variable(session, model, assign, new_id)
+            typer.echo(f"💾 Saved variable '{assign}' -> '{new_id}' to session")
+
+    # Show current variables
+    if session and session_manager:
+        typer.echo(f"Session variables: {session_manager.get_variables(session, model)}")
+    else:
+        typer.echo(f"Model variables: {client.get_variables(model)}")
+
     typer.echo(json.dumps(resp.raw, indent=2))
     if not resp.ok:
         raise typer.Exit(code=1)
@@ -244,10 +312,11 @@ def add_individual(
 @barista_app.command("add-fact")
 def add_fact(
     model: str = typer.Option(..., "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
-    subject: str = typer.Option(..., "--subject", help="Subject individual id (CURIE/IRI in model)"),
-    object_: str = typer.Option(..., "--object", help="Object individual id (CURIE/IRI in model)"),
+    subject: str = typer.Option(..., "--subject", help="Subject individual id (CURIE/IRI in model) or variable name"),
+    object_: str = typer.Option(..., "--object", help="Object individual id (CURIE/IRI in model) or variable name"),
     predicate: str = typer.Option(..., "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
     validate: Optional[List[str]] = typer.Option(None, "--validate", help="Expected types after operation"),
+    session: Optional[str] = typer.Option(None, "--session", help="Session name for loading variables"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV),
     base_url: Optional[str] = typer.Option(None),
     namespace: Optional[str] = typer.Option(None),
@@ -257,10 +326,21 @@ def add_fact(
 ):
     """Add an edge (fact) between two individuals in MODEL.
 
+    Subject and object can be variable names (if --session is used) or actual IDs.
     Optionally validate that expected types are present after creation.
     If validation fails, the operation is automatically rolled back.
     """
     model = _normalize_model_id(model)
+
+    # Resolve session variables if session is specified
+    session_manager, resolved = _resolve_session_variables(
+        session, model,
+        subject=subject,
+        object=object_
+    )
+    subject = resolved["subject"]
+    object_ = resolved["object"]
+
     req = BaristaClient.req_add_fact(model, subject, object_, predicate)
     if dry_run:
         actual_base = base_url or (LIVE_BARISTA_BASE if live else DEFAULT_BARISTA_BASE)
@@ -297,13 +377,14 @@ def add_fact(
 @barista_app.command("add-fact-evidence")
 def add_fact_evidence(
     model: str = typer.Option(..., "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
-    subject: str = typer.Option(..., "--subject", help="Subject individual id"),
-    object_: str = typer.Option(..., "--object", help="Object individual id"),
+    subject: str = typer.Option(..., "--subject", help="Subject individual id or variable name"),
+    object_: str = typer.Option(..., "--object", help="Object individual id or variable name"),
     predicate: str = typer.Option(..., "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
     eco: str = typer.Option(..., "--eco", help="ECO evidence code (e.g., ECO:0000353)"),
     source: List[str] = typer.Option(..., "--source", help="One or more source CURIEs, e.g., PMID:...", rich_help_panel="Evidence"),
     with_from: List[str] = typer.Option(None, "--with", help="Optional with/from CURIEs", rich_help_panel="Evidence"),
     validate: Optional[List[str]] = typer.Option(None, "--validate", help="Expected types after operation"),
+    session: Optional[str] = typer.Option(None, "--session", help="Session name for loading variables"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV),
     base_url: Optional[str] = typer.Option(None),
     namespace: Optional[str] = typer.Option(None),
@@ -313,10 +394,21 @@ def add_fact_evidence(
 ):
     """Add evidence annotation to an edge in MODEL (creates evidence individual and binds).
 
+    Subject and object can be variable names (if --session is used) or actual IDs.
     Optionally validate that expected types are present after creation.
     If validation fails, the operation is automatically rolled back.
     """
     model = _normalize_model_id(model)
+
+    # Resolve session variables if session is specified
+    _, resolved = _resolve_session_variables(
+        session, model,
+        subject=subject,
+        object=object_
+    )
+    subject = resolved["subject"]
+    object_ = resolved["object"]
+
     reqs = BaristaClient.req_add_evidence_to_fact(model, subject, object_, predicate, eco, list(source), list(with_from) if with_from else None)
     if dry_run:
         actual_base = base_url or (LIVE_BARISTA_BASE if live else DEFAULT_BARISTA_BASE)
@@ -386,9 +478,10 @@ def delete_individual(
 @barista_app.command("delete-edge")
 def delete_edge(
     model: str = typer.Option(..., "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
-    subject: str = typer.Option(..., "--subject", help="Subject individual id"),
-    object_: str = typer.Option(..., "--object", help="Object individual id"),
+    subject: str = typer.Option(..., "--subject", help="Subject individual id or variable name"),
+    object_: str = typer.Option(..., "--object", help="Object individual id or variable name"),
     predicate: str = typer.Option(..., "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
+    session: Optional[str] = typer.Option(None, "--session", help="Session name for loading variables"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace"),
@@ -396,8 +489,21 @@ def delete_edge(
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the request without executing"),
     live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
 ):
-    """Delete an edge (fact) between two individuals in a model."""
+    """Delete an edge (fact) between two individuals in a model.
+
+    Subject and object can be variable names (if --session is used) or actual IDs.
+    """
     model = _normalize_model_id(model)
+
+    # Resolve session variables if session is specified
+    _, resolved = _resolve_session_variables(
+        session, model,
+        subject=subject,
+        object=object_
+    )
+    subject = resolved["subject"]
+    object_ = resolved["object"]
+
     req = BaristaClient.req_remove_fact(model, subject, object_, predicate)
     if dry_run:
         actual_base = base_url or (LIVE_BARISTA_BASE if live else DEFAULT_BARISTA_BASE)
@@ -1272,6 +1378,117 @@ def term_bioentities(
         raise typer.Exit(1)
     finally:
         client.close()
+
+
+# ============================================================================
+# Session management commands
+# ============================================================================
+
+@session_app.command("list")
+def session_list():
+    """List all available sessions."""
+    session_manager = SessionManager()
+    sessions = session_manager.list_sessions()
+
+    if not sessions:
+        typer.echo("No sessions found.")
+        typer.echo("Create a session by using --session with add-individual or other commands.")
+    else:
+        typer.echo("Available sessions:")
+        for session_name in sessions:
+            session_file = session_manager._session_file(session_name)
+            typer.echo(f"  • {session_name} ({session_file})")
+
+
+@session_app.command("show")
+def session_show(
+    name: str = typer.Argument(..., help="Session name to show"),
+    model: Optional[str] = typer.Option(None, "--model", help="Filter variables by model ID"),
+):
+    """Show variables stored in a session."""
+    session_manager = SessionManager()
+
+    if name not in session_manager.list_sessions():
+        typer.echo(f"Session '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    session = session_manager.load_session(name)
+
+    typer.echo(f"Session: {name}")
+    if session.model_id:
+        typer.echo(f"Default model: {session.model_id}")
+
+    if not session.variables:
+        typer.echo("No variables stored.")
+    else:
+        typer.echo("\nVariables:")
+
+        # Group by model if no specific model requested
+        if model:
+            model = _normalize_model_id(model)
+            variables = session_manager.get_variables(name, model)
+            if variables:
+                typer.echo(f"\n  Model: {model}")
+                for var_name, actual_id in variables.items():
+                    typer.echo(f"    {var_name:20} -> {actual_id}")
+            else:
+                typer.echo(f"  No variables for model {model}")
+        else:
+            # Group variables by model
+            models_vars: Dict[str, Dict[str, str]] = {}
+            for key, value in session.variables.items():
+                if ":" in key:
+                    model_id, var_name = key.rsplit(":", 1)
+                    if model_id not in models_vars:
+                        models_vars[model_id] = {}
+                    models_vars[model_id][var_name] = value
+
+            for model_id, vars_dict in sorted(models_vars.items()):
+                typer.echo(f"\n  Model: {model_id}")
+                for var_name, actual_id in sorted(vars_dict.items()):
+                    typer.echo(f"    {var_name:20} -> {actual_id}")
+
+
+@session_app.command("clear")
+def session_clear(
+    name: str = typer.Argument(..., help="Session name to clear"),
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Clear all variables in a session."""
+    session_manager = SessionManager()
+
+    if name not in session_manager.list_sessions():
+        typer.echo(f"Session '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    if not confirm:
+        typer.confirm(f"Clear all variables in session '{name}'?", abort=True)
+
+    session_manager.clear_session(name)
+    typer.echo(f"✓ Cleared session '{name}'")
+
+
+@session_app.command("delete")
+def session_delete(
+    name: str = typer.Argument(..., help="Session name to delete"),
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Delete a session completely."""
+    session_manager = SessionManager()
+
+    if name not in session_manager.list_sessions():
+        typer.echo(f"Session '{name}' not found.", err=True)
+        raise typer.Exit(1)
+
+    if not confirm:
+        typer.confirm(f"Delete session '{name}'?", abort=True)
+
+    deleted = session_manager.delete_session(name)
+    if deleted:
+        typer.echo(f"✓ Deleted session '{name}'")
+    else:
+        typer.echo(f"Failed to delete session '{name}'", err=True)
+        raise typer.Exit(1)
 
 
 def main() -> None:
