@@ -87,7 +87,9 @@ class TestAmigoClient:
                         "type": "protein",
                         "taxon": "NCBITaxon:9606",
                         "taxon_label": "Homo sapiens",
-                        "source": "UniProtKB"
+                        "source": "UniProtKB",
+                        "panther_family": "PANTHER:PTHR11454",
+                        "panther_family_label": "insulin/insulin growth factor pthr11454"
                     }
                 ]
             }
@@ -109,6 +111,8 @@ class TestAmigoClient:
         assert results[0].type == "protein"
         assert results[0].taxon == "NCBITaxon:9606"
         assert results[0].taxon_label == "Homo sapiens"
+        assert results[0].panther_family == "PANTHER:PTHR11454"
+        assert results[0].panther_family_label == "insulin/insulin growth factor pthr11454"
 
     def test_search_bioentities_with_filters(self, amigo_client, mock_httpx_client):
         """Test bioentity search builds correct query with all filters."""
@@ -138,6 +142,8 @@ class TestAmigoClient:
         assert "MGI" in url
         assert "rows=5" in url
         assert "start=10" in url
+        assert "panther_family" in url
+        assert "panther_family_label" in url
 
     def test_get_bioentity(self, amigo_client, mock_httpx_client):
         """Test getting a specific bioentity."""
@@ -153,7 +159,9 @@ class TestAmigoClient:
                         "type": "protein",
                         "taxon": "NCBITaxon:9606",
                         "taxon_label": "Homo sapiens",
-                        "source": "UniProtKB"
+                        "source": "UniProtKB",
+                        "panther_family": "PANTHER:PTHR11454",
+                        "panther_family_label": "insulin/insulin growth factor pthr11454"
                     }
                 ]
             }
@@ -396,12 +404,33 @@ class TestDataclasses:
             taxon="NCBITaxon:9606",
             taxon_label="Homo sapiens",
             source="UniProtKB",
+            panther_family="PANTHER:PTHR11454",
+            panther_family_label="insulin/insulin growth factor pthr11454",
             raw={"test": "data"}
         )
 
         assert result.id == "UniProtKB:P12345"
         assert result.label == "INS"
+        assert result.panther_family == "PANTHER:PTHR11454"
+        assert result.panther_family_label == "insulin/insulin growth factor pthr11454"
         assert result.raw == {"test": "data"}
+
+    def test_bioentity_result_without_panther_family(self):
+        """Test BioentityResult dataclass when panther family is not available."""
+        result = BioentityResult(
+            id="UniProtKB:P99999",
+            label="TEST",
+            name="Test protein",
+            type="protein",
+            taxon="NCBITaxon:9606",
+            taxon_label="Homo sapiens",
+            source="UniProtKB",
+            raw={"test": "data"}
+        )
+
+        assert result.id == "UniProtKB:P99999"
+        assert result.panther_family is None
+        assert result.panther_family_label is None
 
     def test_annotation_result(self):
         """Test AnnotationResult dataclass with GAF metadata."""

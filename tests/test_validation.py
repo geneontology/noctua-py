@@ -169,21 +169,23 @@ def test_execute_with_validation():
         _client=client
     )
 
-    with patch.object(client, 'm3_batch', return_value=success_response) as mock_batch:
-        requests = [client.req_add_individual("model123", "GO:0003924")]
+    # Mock _snapshot_model to avoid extra API call
+    with patch.object(client, '_snapshot_model', return_value={"individuals": set(), "facts": set()}):
+        with patch.object(client, 'm3_batch', return_value=success_response) as mock_batch:
+            requests = [client.req_add_individual("model123", "GO:0003924")]
 
-        # Test successful validation
-        response = client.execute_with_validation(
-            requests,
-            expected_individuals=[{"id": "GO:0003924"}]
-        )
+            # Test successful validation
+            response = client.execute_with_validation(
+                requests,
+                expected_individuals=[{"id": "GO:0003924"}]
+            )
 
-        # Should have enabled undo
-        mock_batch.assert_called_once()
-        assert mock_batch.call_args[1]["enable_undo"] is True
+            # Should have enabled undo
+            mock_batch.assert_called_once()
+            assert mock_batch.call_args[1]["enable_undo"] is True
 
-        # Validation should pass
-        assert not response.validation_failed
+            # Validation should pass
+            assert not response.validation_failed
 
 
 def test_execute_with_validation_rollback():
@@ -221,17 +223,19 @@ def test_execute_with_validation_rollback():
         validation_reason="Expected individuals not found"
     )
 
-    with patch.object(client, 'm3_batch') as mock_batch:
-        # First call returns wrong response, second call (undo) returns undo response
-        mock_batch.side_effect = [wrong_response, undo_response]
+    # Mock _snapshot_model to avoid extra API call
+    with patch.object(client, '_snapshot_model', return_value={"individuals": set(), "facts": set()}):
+        with patch.object(client, 'm3_batch') as mock_batch:
+            # First call returns wrong response, second call (undo) returns undo response
+            mock_batch.side_effect = [wrong_response, undo_response]
 
-        requests = [client.req_add_individual("model123", "GO:0003924")]
+            requests = [client.req_add_individual("model123", "GO:0003924")]
 
-        # Execute with validation expecting GO:0003924
-        response = client.execute_with_validation(
-            requests,
-            expected_individuals=[{"id": "GO:0003924"}]
-        )
+            # Execute with validation expecting GO:0003924
+            response = client.execute_with_validation(
+                requests,
+                expected_individuals=[{"id": "GO:0003924"}]
+            )
 
         # Should have called m3_batch twice (execute + undo)
         assert mock_batch.call_count == 2

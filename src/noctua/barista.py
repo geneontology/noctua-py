@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
@@ -61,6 +61,7 @@ class BaristaResponse:
     raw: Dict[str, Any]
     validation_failed: bool = False
     validation_reason: Optional[str] = None
+    model_vars: Dict[str, str] = field(default_factory=dict)
     _original_requests: Optional[List[Dict[str, Any]]] = None
     _client: Optional['BaristaClient'] = None
     _before_state: Optional[Dict[str, Any]] = None
@@ -720,6 +721,42 @@ class BaristaClient:
 
         return None
 
+    def _handle_variable_tracking_for_requests(
+        self,
+        requests: List[Dict[str, Any]],
+        response: BaristaResponse,
+        before_state: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Handle variable tracking for any requests that include assign-to-variable.
+
+        This method updates the response.model_vars and internal registry.
+        Should only be called when the operation succeeded (response.ok or response.succeeded).
+
+        Args:
+            requests: The original requests that were executed
+            response: The response from the operation (must be successful)
+            before_state: Optional model snapshot taken before operation
+        """
+        if not self.track_variables or not response.ok:
+            return
+
+        # Look for requests with assign-to-variable
+        for req in requests:
+            if req.get("operation") == "add" and req.get("entity") == "individual":
+                args = req.get("arguments", {})
+                variable = args.get("assign-to-variable")
+                model_id = args.get("model-id")
+
+                if variable and model_id and before_state:
+                    # Track the new individual
+                    new_id = self._track_new_individual(model_id, before_state, response, variable)
+
+                    # Add to response.model_vars
+                    if new_id:
+                        if not hasattr(response, 'model_vars'):
+                            response.model_vars = {}
+                        response.model_vars[variable] = new_id
+
     # Low-level
     def m3_batch(self, requests: List[Dict[str, Any]], privileged: bool = True, enable_undo: bool = False) -> BaristaResponse:
         """Execute a batch of requests against the Minerva API.
@@ -1110,9 +1147,9 @@ class BaristaClient:
         req = self.req_add_individual(model_id, class_curie, assign_var)
         response = self.m3_batch([req], enable_undo=enable_undo)
 
-        # Track the new individual if successful
-        if before_state is not None and response.ok:
-            self._track_new_individual(model_id, before_state, response, assign_var)
+        # Handle variable tracking if successful
+        if response.ok and before_state:
+            self._handle_variable_tracking_for_requests([req], response, before_state)
 
         return response
 
@@ -1615,13 +1652,14 @@ class BaristaClient:
         requests: List[Dict[str, Any]],
         expected_individuals: Optional[List[Dict[str, str]]] = None,
         expected_facts: Optional[List[Dict[str, str]]] = None,
-        privileged: bool = True
+        privileged: bool = True,
+        track_variables: Optional[bool] = None
     ) -> BaristaResponse:
         """Execute requests with validation and automatic rollback on failure.
 
         This method executes a batch of requests with undo enabled, then validates
         the result against expected conditions. If validation fails, it automatically
-        rolls back the changes.
+        rolls back the changes. Variables are only tracked if validation succeeds.
 
         Args:
             requests: List of request dictionaries to execute
@@ -1629,6 +1667,7 @@ class BaristaClient:
                                 e.g., [{"id": "GO:0004672", "label": "protein kinase activity"}]
             expected_facts: List of expected facts (not yet implemented)
             privileged: Whether to use the privileged endpoint
+            track_variables: Whether to track variables (defaults to self.track_variables)
 
         Returns:
             BaristaResponse - either the successful response or the rollback response
@@ -1644,6 +1683,20 @@ class BaristaClient:
             >>> #     print(f"Rolled back: {response.validation_reason}")
             ... # doctest: +SKIP
         """
+        # Determine if we should track variables
+        should_track = track_variables if track_variables is not None else self.track_variables
+
+        # Take snapshot for variable tracking if needed
+        before_state = None
+        if should_track:
+            # Extract model_id from first request with model-id
+            model_id = None
+            for req in requests:
+                model_id = req.get("arguments", {}).get("model-id")
+                if model_id:
+                    before_state = self._snapshot_model(model_id)
+                    break
+
         # Always enable undo for validation
         response = self.m3_batch(requests, privileged=privileged, enable_undo=True)
 
@@ -1661,6 +1714,10 @@ class BaristaClient:
             # TODO: Implement fact validation
             pass
 
+        # Only track variables if validation succeeded (or wasn't used)
+        if should_track and not response.validation_failed and before_state:
+            self._handle_variable_tracking_for_requests(requests, response, before_state)
+
         return response
 
     def add_individual_validated(
@@ -1672,12 +1729,15 @@ class BaristaClient:
     ) -> BaristaResponse:
         """Add an individual with validation that it was created with the expected type.
 
+        Variable tracking only occurs if validation succeeds. If validation fails and
+        the operation is rolled back, no variable mapping is created.
+
         Args:
             model_id: The model ID
             class_curie: The class/type for the individual
             expected_type: Expected type dict with 'id' and/or 'label'
                          If not provided, validates against class_curie
-            assign_var: Variable name to assign
+            assign_var: Variable name to assign (only if validation succeeds)
 
         Returns:
             BaristaResponse - rolls back automatically if validation fails
@@ -1686,10 +1746,13 @@ class BaristaClient:
             expected_type = {"id": class_curie}
 
         req = self.req_add_individual(model_id, class_curie, assign_var)
-        return self.execute_with_validation(
+        response = self.execute_with_validation(
             [req],
-            expected_individuals=[expected_type]
+            expected_individuals=[expected_type],
+            track_variables=True  # Explicitly enable tracking (only happens on success)
         )
+
+        return response
 
     def update_individual_annotation(
         self,

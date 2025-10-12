@@ -16,3 +16,7 @@ from .amigo import (
     BioentityResult as BioentityResult,
     AnnotationResult as AnnotationResult,
 )
+from .session import (
+    SessionManager as SessionManager,
+    SessionData as SessionData,
+)

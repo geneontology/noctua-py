@@ -28,7 +28,9 @@ class BioentityResult:
     taxon: str
     taxon_label: str
     source: str
-    raw: Dict[str, Any]  # Full Solr document
+    panther_family: Optional[str] = None
+    panther_family_label: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None  # Full Solr document
 
 
 @dataclass
@@ -186,7 +188,7 @@ class AmigoClient:
             "q": query,
             "rows": str(limit),
             "start": str(offset),
-            "fl": "bioentity,bioentity_label,bioentity_name,type,taxon,taxon_label,source"
+            "fl": "bioentity,bioentity_label,bioentity_name,type,taxon,taxon_label,source,panther_family,panther_family_label"
         }
 
         response = self._query(params)
@@ -201,6 +203,8 @@ class AmigoClient:
                 taxon=doc.get("taxon", ""),
                 taxon_label=doc.get("taxon_label", ""),
                 source=doc.get("source", ""),
+                panther_family=doc.get("panther_family"),
+                panther_family_label=doc.get("panther_family_label"),
                 raw=doc
             )
             for doc in docs
@@ -219,7 +223,7 @@ class AmigoClient:
         params = {
             "q": f"document_category:bioentity AND bioentity:\"{bioentity_id}\"",
             "rows": "1",
-            "fl": "bioentity,bioentity_label,bioentity_name,type,taxon,taxon_label,source"
+            "fl": "bioentity,bioentity_label,bioentity_name,type,taxon,taxon_label,source,panther_family,panther_family_label"
         }
 
         response = self._query(params)
@@ -237,6 +241,8 @@ class AmigoClient:
             taxon=doc.get("taxon", ""),
             taxon_label=doc.get("taxon_label", ""),
             source=doc.get("source", ""),
+            panther_family=doc.get("panther_family"),
+            panther_family_label=doc.get("panther_family_label"),
             raw=doc
         )
 

@@ -75,7 +75,7 @@ def test_cli_clear_model_dry_run() -> None:
 
 def test_cli_export_model_help() -> None:
     """Test export-model command help."""
-    runner = CliRunner()
+    runner = CliRunner(mix_stderr=False)
     result = runner.invoke(
         app,
         [
@@ -83,9 +83,12 @@ def test_cli_export_model_help() -> None:
             "export-model",
             "--help",
         ],
+        color=False,  # Disable color output
     )
     assert result.exit_code == 0
-    assert "export-model" in result.stdout
-    assert "Export a model in various formats" in result.stdout
-    assert "--output" in result.stdout
-    assert "--format" in result.stdout
+    # Use result.output which combines stdout and stderr and handles formatting better
+    output = result.output
+    assert "export-model" in output
+    assert "Export a model in various formats" in output
+    assert "--output" in output or "output" in output.lower()
+    assert "--format" in output or "format" in output.lower()

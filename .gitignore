@@ -1,3 +1,4 @@
+.noctua
 tests/output
 tests/*/*/output
 .idea
