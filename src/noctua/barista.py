@@ -640,12 +640,14 @@ class BaristaClient:
 
     def _rollback_executed_requests(
         self,
-        executed_requests: List[Tuple[MinervaRequest, Dict, Dict]]
+        executed_requests: List[Tuple[MinervaRequest, Dict, Dict]],
+        privileged: bool = True
     ) -> BaristaResponse:
         """Rollback executed requests using their reverse operations.
 
         Args:
             executed_requests: List of (request, before_state, after_state) tuples
+            privileged: Whether to use privileged endpoint for rollback
 
         Returns:
             BaristaResponse from executing the rollback
@@ -662,7 +664,7 @@ class BaristaClient:
 
         # Execute rollback (simple batch, no validation)
         if undo_requests:
-            return self._execute_simple_batch(undo_requests, privileged=True)
+            return self._execute_simple_batch(undo_requests, privileged=privileged)
         else:
             return BaristaResponse(raw={"message-type": "success", "message": "Rollback complete (no-op)"})
 
@@ -826,7 +828,7 @@ class BaristaClient:
             logger.error(f"Batch execution failed: {e}")
             logger.info(f"Rolling back {len(executed_requests)} request(s)...")
 
-            rollback_response = self._rollback_executed_requests(executed_requests)
+            rollback_response = self._rollback_executed_requests(executed_requests, privileged=privileged)
 
             # RESTORE VARIABLES
             if self.track_variables:

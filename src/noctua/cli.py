@@ -1181,8 +1181,12 @@ def add_protein_complex(
     components = []
     for spec in component:
         parsed = _parse_component_spec(spec)
+        # Validate required entity_id
+        if not parsed["entity_id"]:
+            typer.echo(f"Error: Component specification missing entity_id: {spec}", err=True)
+            raise typer.Exit(code=1)
         components.append(ProteinComplexComponent(
-            entity_id=parsed["entity_id"],  # type: ignore[arg-type]
+            entity_id=parsed["entity_id"],
             label=parsed["label"],
             evidence_type=parsed["evidence_type"],
             reference=parsed["reference"]
@@ -1266,8 +1270,12 @@ def add_entity_set(
     members = []
     for spec in member:
         parsed = _parse_component_spec(spec)
+        # Validate required entity_id
+        if not parsed["entity_id"]:
+            typer.echo(f"Error: Member specification missing entity_id: {spec}", err=True)
+            raise typer.Exit(code=1)
         members.append(EntitySetMember(
-            entity_id=parsed["entity_id"],  # type: ignore[arg-type]
+            entity_id=parsed["entity_id"],
             label=parsed["label"],
             evidence_type=parsed["evidence_type"],
             reference=parsed["reference"]
