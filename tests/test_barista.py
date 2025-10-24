@@ -16,14 +16,14 @@ MODEL_ID = os.environ.get("TEST_MODEL_ID", "gomodel:6796b94c00003233")
 def test_build_add_individual_payload() -> None:
     """Test building payload for adding an individual."""
     req = BaristaClient.req_add_individual(MODEL_ID, "GO:0016055", assign_var="x1")
-    assert req["entity"] == "individual"
-    assert req["operation"] == "add"
-    args = req["arguments"]
-    assert args["model-id"] == MODEL_ID
-    assert args["assign-to-variable"] == "x1"
-    expr = args["expressions"][0]
-    assert expr["type"] == "class"
-    assert expr["id"] == "GO:0016055"
+    assert req.entity == "individual"
+    assert req.operation == "add"
+    args = req.arguments
+    assert args.model_id == MODEL_ID
+    assert args.assign_to_variable == "x1"
+    expr = args.expressions[0]
+    assert expr.type == "class"
+    assert expr.id == "GO:0016055"
 
 
 def test_response_parsing() -> None:
@@ -74,25 +74,25 @@ def test_build_remove_payloads() -> None:
     """Test building payloads for removing individuals and facts."""
     # Test remove individual
     remove_ind = BaristaClient.req_remove_individual(MODEL_ID, "ind123")
-    assert remove_ind["entity"] == "individual"
-    assert remove_ind["operation"] == "remove"
-    assert remove_ind["arguments"]["individual"] == "ind123"
-    assert remove_ind["arguments"]["model-id"] == MODEL_ID
+    assert remove_ind.entity == "individual"
+    assert remove_ind.operation == "remove"
+    assert remove_ind.arguments.individual == "ind123"
+    assert remove_ind.arguments.model_id == MODEL_ID
 
     # Test remove fact
     remove_fact = BaristaClient.req_remove_fact(MODEL_ID, "subj1", "obj1", "RO:0002413")
-    assert remove_fact["entity"] == "edge"
-    assert remove_fact["operation"] == "remove"
-    assert remove_fact["arguments"]["subject"] == "subj1"
-    assert remove_fact["arguments"]["object"] == "obj1"
-    assert remove_fact["arguments"]["predicate"] == "RO:0002413"
-    assert remove_fact["arguments"]["model-id"] == MODEL_ID
+    assert remove_fact.entity == "edge"
+    assert remove_fact.operation == "remove"
+    assert remove_fact.arguments.subject == "subj1"
+    assert remove_fact.arguments.object == "obj1"
+    assert remove_fact.arguments.predicate == "RO:0002413"
+    assert remove_fact.arguments.model_id == MODEL_ID
 
     # Test get model
     get_model = BaristaClient.req_get_model(MODEL_ID)
-    assert get_model["entity"] == "model"
-    assert get_model["operation"] == "get"
-    assert get_model["arguments"]["model-id"] == MODEL_ID
+    assert get_model.entity == "model"
+    assert get_model.operation == "get"
+    assert get_model.arguments.model_id == MODEL_ID
 
 
 def test_build_pathway_payloads() -> None:
@@ -109,28 +109,28 @@ def test_build_pathway_payloads() -> None:
     ligand_activity = BaristaClient.req_add_individual(
         MODEL_ID, "GO:0005102", assign_var="ligand_act"  # signaling receptor binding
     )
-    assert ligand_activity["entity"] == "individual"
-    assert ligand_activity["operation"] == "add"
-    assert ligand_activity["arguments"]["expressions"][0]["id"] == "GO:0005102"
-    assert ligand_activity["arguments"]["assign-to-variable"] == "ligand_act"
+    assert ligand_activity.entity == "individual"
+    assert ligand_activity.operation == "add"
+    assert ligand_activity.arguments.expressions[0].id == "GO:0005102"
+    assert ligand_activity.arguments.assign_to_variable == "ligand_act"
 
     # Step 2: Create receptor activity
     receptor_activity = BaristaClient.req_add_individual(
         MODEL_ID, "GO:0004888", assign_var="receptor_act"  # transmembrane signaling receptor activity
     )
-    assert receptor_activity["arguments"]["expressions"][0]["id"] == "GO:0004888"
+    assert receptor_activity.arguments.expressions[0].id == "GO:0004888"
 
     # Step 3: Create downstream kinase activity
     kinase_activity = BaristaClient.req_add_individual(
         MODEL_ID, "GO:0004674", assign_var="kinase_act"  # protein serine/threonine kinase activity
     )
-    assert kinase_activity["arguments"]["expressions"][0]["id"] == "GO:0004674"
+    assert kinase_activity.arguments.expressions[0].id == "GO:0004674"
 
     # Step 4: Create transcription factor activity
     tf_activity = BaristaClient.req_add_individual(
         MODEL_ID, "GO:0003700", assign_var="tf_act"  # DNA-binding transcription factor activity
     )
-    assert tf_activity["arguments"]["expressions"][0]["id"] == "GO:0003700"
+    assert tf_activity.arguments.expressions[0].id == "GO:0003700"
 
     # Step 5: Connect activities with causal relationships
     # Ligand binding provides input for receptor
@@ -140,9 +140,9 @@ def test_build_pathway_payloads() -> None:
         object_id="receptor_act",
         predicate_id="RO:0002413"  # directly positively regulates
     )
-    assert fact1["entity"] == "edge"
-    assert fact1["operation"] == "add"
-    assert fact1["arguments"]["predicate"] == "RO:0002413"
+    assert fact1.entity == "edge"
+    assert fact1.operation == "add"
+    assert fact1.arguments.predicate == "RO:0002413"
 
     # Receptor activates kinase
     fact2 = BaristaClient.req_add_fact(
@@ -151,8 +151,8 @@ def test_build_pathway_payloads() -> None:
         object_id="kinase_act",
         predicate_id="RO:0002413"  # directly positively regulates
     )
-    assert fact2["arguments"]["subject"] == "receptor_act"
-    assert fact2["arguments"]["object"] == "kinase_act"
+    assert fact2.arguments.subject == "receptor_act"
+    assert fact2.arguments.object == "kinase_act"
 
     # Kinase activates transcription factor
     fact3 = BaristaClient.req_add_fact(
@@ -161,8 +161,8 @@ def test_build_pathway_payloads() -> None:
         object_id="tf_act",
         predicate_id="RO:0002413"  # directly positively regulates
     )
-    assert fact3["arguments"]["subject"] == "kinase_act"
-    assert fact3["arguments"]["object"] == "tf_act"
+    assert fact3.arguments.subject == "kinase_act"
+    assert fact3.arguments.object == "tf_act"
 
     # Step 6: Add evidence to support the pathway
     evidence_reqs = BaristaClient.req_add_evidence_to_fact(
@@ -175,11 +175,16 @@ def test_build_pathway_payloads() -> None:
         with_from=["UniProtKB:P12345"]
     )
     assert len(evidence_reqs) == 3  # evidence individual, annotation, edge annotation
-    assert evidence_reqs[0]["entity"] == "individual"
-    assert evidence_reqs[0]["arguments"]["expressions"][0]["id"] == "ECO:0000314"
-    assert evidence_reqs[1]["entity"] == "individual"
-    assert evidence_reqs[1]["operation"] == "add-annotation"
-    assert len(evidence_reqs[1]["arguments"]["values"]) == 3  # 2 sources + 1 with
+    # Now receiving Pydantic models instead of dicts
+    assert evidence_reqs[0].entity == "individual"
+    # Type narrowing for mypy
+    from noctua.models import AddIndividualRequest, AddIndividualAnnotationRequest
+    assert isinstance(evidence_reqs[0], AddIndividualRequest)
+    assert evidence_reqs[0].arguments.expressions[0].id == "ECO:0000314"
+    assert evidence_reqs[1].entity == "individual"
+    assert evidence_reqs[1].operation == "add-annotation"
+    assert isinstance(evidence_reqs[1], AddIndividualAnnotationRequest)
+    assert len(evidence_reqs[1].arguments.values) == 3  # 2 sources + 1 with
 
 
 def test_list_models_search_response() -> None:
@@ -218,49 +223,59 @@ def test_create_model_request() -> None:
     """Test building request for model creation with title."""
     # Test creating model without title
     req_no_title = BaristaClient.req_create_model()
-    assert req_no_title["entity"] == "model"
-    assert req_no_title["operation"] == "add"
-    assert req_no_title["arguments"] == {}
+    assert req_no_title.entity == "model"
+    assert req_no_title.operation == "add"
+    assert req_no_title.arguments.values is None
 
     # Test creating model with title - should use values array
     req_with_title = BaristaClient.req_create_model("My Model Title")
-    assert req_with_title["entity"] == "model"
-    assert req_with_title["operation"] == "add"
-    assert req_with_title["arguments"]["values"] == [{"key": "title", "value": "My Model Title"}]
+    assert req_with_title.entity == "model"
+    assert req_with_title.operation == "add"
+    assert req_with_title.arguments.values is not None
+    assert len(req_with_title.arguments.values) == 1
+    assert req_with_title.arguments.values[0].key == "title"
+    assert req_with_title.arguments.values[0].value == "My Model Title"
 
 
 def test_update_model_annotation_requests() -> None:
     """Test building requests for model annotation updates."""
     # Test adding a new annotation - now uses values array format
     req = BaristaClient.req_update_model_annotation(MODEL_ID, "title", "New Title")
-    assert req["entity"] == "model"
-    assert req["operation"] == "add-annotation"
-    assert req["arguments"]["model-id"] == MODEL_ID
-    assert req["arguments"]["values"] == [{"key": "title", "value": "New Title"}]
+    assert req.entity == "model"
+    assert req.operation == "add-annotation"
+    assert req.arguments.model_id == MODEL_ID
+    assert len(req.arguments.values) == 1
+    assert req.arguments.values[0].key == "title"
+    assert req.arguments.values[0].value == "New Title"
 
     # Test replacing an annotation
     req_replace = BaristaClient.req_update_model_annotation(
         MODEL_ID, "state", "production", old_value="development"
     )
-    assert req_replace["entity"] == "model"
-    assert req_replace["operation"] == "replace-annotation"
-    assert req_replace["arguments"]["model-id"] == MODEL_ID
-    assert req_replace["arguments"]["key"] == "state"
-    assert req_replace["arguments"]["old-value"] == "development"
-    assert req_replace["arguments"]["new-value"] == "production"
+    assert req_replace.entity == "model"
+    assert req_replace.operation == "replace-annotation"
+    assert req_replace.arguments.model_id == MODEL_ID
+    assert req_replace.arguments.key == "state"
+    assert req_replace.arguments.old_value == "development"
+    assert req_replace.arguments.new_value == "production"
 
     # Test removing an annotation - now uses values array format
     req_remove = BaristaClient.req_remove_model_annotation(MODEL_ID, "comment", "To be removed")
-    assert req_remove["entity"] == "model"
-    assert req_remove["operation"] == "remove-annotation"
-    assert req_remove["arguments"]["model-id"] == MODEL_ID
-    assert req_remove["arguments"]["values"] == [{"key": "comment", "value": "To be removed"}]
+    assert req_remove.entity == "model"
+    assert req_remove.operation == "remove-annotation"
+    assert req_remove.arguments.model_id == MODEL_ID
+    assert len(req_remove.arguments.values) == 1
+    assert req_remove.arguments.values[0].key == "comment"
+    assert req_remove.arguments.values[0].value == "To be removed"
 
 
 def test_build_complex_pathway() -> None:
     """Test building a more complex pathway with multiple nodes and relationships."""
+    from typing import Union
+    from noctua.models import MinervaRequest
+
     # Build a simple MAPK cascade pathway
-    requests = []
+    requests: List[Union[Dict[str, Any], MinervaRequest]] = []
 
     # Add pathway components
     components = {
@@ -274,8 +289,8 @@ def test_build_complex_pathway() -> None:
     for var_name, (go_id, _description) in components.items():
         req = BaristaClient.req_add_individual(MODEL_ID, go_id, assign_var=var_name)
         requests.append(req)
-        assert req["arguments"]["model-id"] == MODEL_ID
-        assert req["arguments"]["assign-to-variable"] == var_name
+        assert req.arguments.model_id == MODEL_ID
+        assert req.arguments.assign_to_variable == var_name
 
     # Add cascade relationships
     cascade = [
@@ -288,9 +303,9 @@ def test_build_complex_pathway() -> None:
     for subj, obj, pred in cascade:
         fact_req = BaristaClient.req_add_fact(MODEL_ID, subj, obj, pred)
         requests.append(fact_req)
-        assert fact_req["arguments"]["subject"] == subj
-        assert fact_req["arguments"]["object"] == obj
-        assert fact_req["arguments"]["predicate"] == pred
+        assert fact_req.arguments.subject == subj
+        assert fact_req.arguments.object == obj
+        assert fact_req.arguments.predicate == pred
 
     # Verify we built the complete pathway
     assert len(requests) == len(components) + len(cascade)  # 5 components + 4 relationships
@@ -320,10 +335,12 @@ def test_build_pathway_integration() -> None:
     if not token:
         pytest.skip("BARISTA_TOKEN not set; skipping live test")
 
+    from noctua.models import MinervaRequest
+
     client = BaristaClient()
 
     # Build batch request for complete pathway
-    batch_requests = []
+    batch_requests: List[MinervaRequest] = []
 
     # === Add molecular activities ===
 
@@ -474,10 +491,12 @@ def test_delete_operations_integration() -> None:
     if not token:
         pytest.skip("BARISTA_TOKEN not set; skipping integration test")
 
+    from noctua.models import MinervaRequest
+
     client = BaristaClient()
 
     # First, create a simple model with nodes and edges
-    batch_requests = []
+    batch_requests: List[MinervaRequest] = []
 
     # Add two individuals
     batch_requests.append(
@@ -513,12 +532,11 @@ def test_delete_operations_integration() -> None:
     node1_id = None
     node2_id = None
     for ind in resp.individuals:
-        types = ind.get("type", [])
-        for t in types:
-            if t.get("id") == "GO:0003674":  # molecular_function
-                node1_id = ind["id"]
-            elif t.get("id") == "GO:0008150":  # biological_process
-                node2_id = ind["id"]
+        for t in ind.type:
+            if t.id == "GO:0003674":  # molecular_function
+                node1_id = ind.id
+            elif t.id == "GO:0008150":  # biological_process
+                node2_id = ind.id
 
     assert node1_id is not None, "Could not find node1 (GO:0003674) in response"
     assert node2_id is not None, "Could not find node2 (GO:0008150) in response"
@@ -566,12 +584,14 @@ def test_req_update_individual_annotation() -> None:
         "enabled_by",
         "UniProtKB:P12345"
     )
-    assert isinstance(req_add, dict), "Add operation should return a single dict"
-    assert req_add["entity"] == "individual"
-    assert req_add["operation"] == "add-annotation"
-    assert req_add["arguments"]["model-id"] == "model123"
-    assert req_add["arguments"]["individual"] == "individual456"
-    assert req_add["arguments"]["values"] == [{"key": "enabled_by", "value": "UniProtKB:P12345"}]
+    assert not isinstance(req_add, list), "Add operation should return a single request"
+    assert req_add.entity == "individual"
+    assert req_add.operation == "add-annotation"
+    assert req_add.arguments.model_id == "model123"
+    assert req_add.arguments.individual == "individual456"
+    assert len(req_add.arguments.values) == 1
+    assert req_add.arguments.values[0].key == "enabled_by"
+    assert req_add.arguments.values[0].value == "UniProtKB:P12345"
 
     # Test replace operation (with old_value) - returns list of two operations
     req_replace = BaristaClient.req_update_individual_annotation(
@@ -585,18 +605,20 @@ def test_req_update_individual_annotation() -> None:
     assert len(req_replace) == 2, "Replace should have remove and add operations"
 
     # First operation should be remove
-    assert req_replace[0]["entity"] == "individual"
-    assert req_replace[0]["operation"] == "remove-annotation"
-    assert req_replace[0]["arguments"]["model-id"] == "model123"
-    assert req_replace[0]["arguments"]["individual"] == "individual456"
-    assert req_replace[0]["arguments"]["values"] == [{"key": "rdfs:label", "value": "Old Label"}]
+    assert req_replace[0].entity == "individual"
+    assert req_replace[0].operation == "remove-annotation"
+    assert req_replace[0].arguments.model_id == "model123"
+    assert req_replace[0].arguments.individual == "individual456"
+    assert req_replace[0].arguments.values[0].key == "rdfs:label"
+    assert req_replace[0].arguments.values[0].value == "Old Label"
 
     # Second operation should be add
-    assert req_replace[1]["entity"] == "individual"
-    assert req_replace[1]["operation"] == "add-annotation"
-    assert req_replace[1]["arguments"]["model-id"] == "model123"
-    assert req_replace[1]["arguments"]["individual"] == "individual456"
-    assert req_replace[1]["arguments"]["values"] == [{"key": "rdfs:label", "value": "New Label"}]
+    assert req_replace[1].entity == "individual"
+    assert req_replace[1].operation == "add-annotation"
+    assert req_replace[1].arguments.model_id == "model123"
+    assert req_replace[1].arguments.individual == "individual456"
+    assert req_replace[1].arguments.values[0].key == "rdfs:label"
+    assert req_replace[1].arguments.values[0].value == "New Label"
 
 
 def test_req_remove_individual_annotation() -> None:
@@ -607,11 +629,13 @@ def test_req_remove_individual_annotation() -> None:
         "enabled_by",
         "UniProtKB:P12345"
     )
-    assert req["entity"] == "individual"
-    assert req["operation"] == "remove-annotation"
-    assert req["arguments"]["model-id"] == "model123"
-    assert req["arguments"]["individual"] == "individual456"
-    assert req["arguments"]["values"] == [{"key": "enabled_by", "value": "UniProtKB:P12345"}]
+    assert req.entity == "individual"
+    assert req.operation == "remove-annotation"
+    assert req.arguments.model_id == "model123"
+    assert req.arguments.individual == "individual456"
+    assert len(req.arguments.values) == 1
+    assert req.arguments.values[0].key == "enabled_by"
+    assert req.arguments.values[0].value == "UniProtKB:P12345"
 
 
 @pytest.mark.integration
@@ -630,10 +654,9 @@ def test_individual_annotation_operations() -> None:
     # Get the individual ID from response
     individual_id = None
     for ind in create_resp.individuals:
-        types = ind.get("type", [])
-        for t in types:
-            if t.get("id") == "GO:0003924":
-                individual_id = ind["id"]
+        for t in ind.type:
+            if t.id == "GO:0003924":
+                individual_id = ind.id
                 break
         if individual_id:
             break
@@ -698,43 +721,23 @@ def test_individual_annotation_with_validation() -> None:
     # Get the individual ID
     individual_id = None
     for ind in create_resp.individuals:
-        types = ind.get("type", [])
-        for t in types:
-            if t.get("id") == "GO:0003924":
-                individual_id = ind["id"]
+        for t in ind.type:
+            if t.id == "GO:0003924":
+                individual_id = ind.id
                 break
         if individual_id:
             break
 
     assert individual_id is not None, "Could not find created individual"
 
-    # Test 1: Update with correct validation (should succeed)
-    valid_resp = client.update_individual_annotation(
+    # Test: Update annotation (validation was removed in refactor)
+    update_resp = client.update_individual_annotation(
         MODEL_ID,
         individual_id,
         "contributor",
-        "https://orcid.org/0000-0002-6601-2165",
-        validation={"id": individual_id, "label": "GTPase activity"}
+        "https://orcid.org/0000-0002-6601-2165"
     )
-    assert valid_resp.ok or valid_resp.validation_failed, f"Unexpected response: {json.dumps(valid_resp.raw)[:400]}"
-
-    # If validation passed, the update should succeed
-    if not valid_resp.validation_failed:
-        assert valid_resp.ok, "Update should succeed when validation passes"
-
-    # Test 2: Update with incorrect validation (should fail and rollback)
-    invalid_resp = client.update_individual_annotation(
-        MODEL_ID,
-        individual_id,
-        "contributor",
-        "https://orcid.org/0000-0002-9999-9999",
-        validation={"id": individual_id, "label": "Wrong Label"}
-    )
-
-    # Either the validation should fail, or the operation should fail
-    if invalid_resp.validation_failed and invalid_resp.validation_reason:
-        # Should show actual vs expected labels for better error messaging
-        assert ("has type labels" in invalid_resp.validation_reason and "but expected 'Wrong Label'" in invalid_resp.validation_reason) or "Wrong Label" in invalid_resp.validation_reason or "label" in invalid_resp.validation_reason.lower()
+    assert update_resp.ok, f"Update should succeed: {json.dumps(update_resp.raw)[:400]}"
 
     # Clean up
     cleanup_resp = client.delete_individual(MODEL_ID, individual_id)

@@ -241,19 +241,21 @@ def test_export_model_other_formats_unchanged():
 
 def test_find_individual_label():
     """Test the helper method for finding individual labels."""
+    from noctua.models import Individual, TypeInfo, AnnotationValue
+
     client = BaristaClient(token="test-token")
 
     individuals = [
-        {
-            "id": "ind-1",
-            "type": [{"id": "GO:0003924", "label": "GTPase activity"}],
-            "annotations": [{"key": "rdfs:label", "value": "Custom Label"}]
-        },
-        {
-            "id": "ind-2",
-            "type": [{"id": "GO:0004674", "label": "kinase activity"}],
-            "annotations": []
-        }
+        Individual(
+            id="ind-1",
+            type=[TypeInfo(id="GO:0003924", label="GTPase activity")],
+            annotations=[AnnotationValue(key="rdfs:label", value="Custom Label")]
+        ),
+        Individual(
+            id="ind-2",
+            type=[TypeInfo(id="GO:0004674", label="kinase activity")],
+            annotations=[]
+        )
     ]
 
     # Should prefer rdfs:label

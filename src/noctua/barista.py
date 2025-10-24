@@ -2,10 +2,50 @@ from __future__ import annotations
 
 import os
 import json
+import copy
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union, Tuple
 
 import httpx
+
+from .models import (
+    AddIndividualRequest,
+    AddIndividualArguments,
+    RemoveIndividualRequest,
+    RemoveIndividualArguments,
+    AddEdgeRequest,
+    AddEdgeArguments,
+    RemoveEdgeRequest,
+    RemoveEdgeArguments,
+    AddIndividualAnnotationRequest,
+    AddIndividualAnnotationArguments,
+    RemoveIndividualAnnotationRequest,
+    RemoveIndividualAnnotationArguments,
+    CreateModelRequest,
+    CreateModelArguments,
+    GetModelRequest,
+    GetModelArguments,
+    ExportModelRequest,
+    ExportModelArguments,
+    AddModelAnnotationRequest,
+    AddModelAnnotationArguments,
+    RemoveModelAnnotationRequest,
+    RemoveModelAnnotationArguments,
+    ReplaceModelAnnotationRequest,
+    ReplaceModelAnnotationArguments,
+    Expression,
+    AnnotationValue,
+    ProteinComplexComponent,
+    EntitySetMember,
+    MinervaRequest,
+    ModelData,
+    Individual,
+    Fact,
+    TypeInfo,
+)
+
+logger = logging.getLogger(__name__)
 
 # Default to test/dev server for safety
 DEFAULT_BARISTA_BASE = os.environ.get("BARISTA_BASE", "http://barista-dev.berkeleybop.org")
@@ -20,7 +60,40 @@ BARISTA_TOKEN_ENV = "BARISTA_TOKEN"
 
 
 class BaristaError(Exception):
+    """Base exception for Barista client errors."""
     pass
+
+
+class BatchExecutionError(BaristaError):
+    """Raised when a request in a batch fails at the API level."""
+
+    def __init__(
+        self,
+        message: str,
+        executed_requests: List['MinervaRequest'],
+        failed_request: 'MinervaRequest',
+        failed_response: 'BaristaResponse'
+    ):
+        super().__init__(message)
+        self.executed_requests = executed_requests
+        self.failed_request = failed_request
+        self.failed_response = failed_response
+
+
+class BatchValidationError(BaristaError):
+    """Raised when a request in a batch fails validation."""
+
+    def __init__(
+        self,
+        message: str,
+        executed_requests: List['MinervaRequest'],
+        failed_request: 'MinervaRequest',
+        validation_reason: str
+    ):
+        super().__init__(message)
+        self.executed_requests = executed_requests
+        self.failed_request = failed_request
+        self.validation_reason = validation_reason
 
 
 @dataclass
@@ -61,10 +134,12 @@ class BaristaResponse:
     raw: Dict[str, Any]
     validation_failed: bool = False
     validation_reason: Optional[str] = None
+    failed_request_index: Optional[int] = None  # Index of the failed request in a batch
     model_vars: Dict[str, str] = field(default_factory=dict)
     _original_requests: Optional[List[Dict[str, Any]]] = None
     _client: Optional['BaristaClient'] = None
     _before_state: Optional[Dict[str, Any]] = None
+    _parsed_data: Optional[ModelData] = None  # Cached parsed response data
 
     @property
     def ok(self) -> bool:
@@ -155,227 +230,52 @@ class BaristaResponse:
         return self.raw.get("intention")
 
     @property
+    def data(self) -> ModelData:
+        """Get parsed model data from the response.
+
+        Returns:
+            Pydantic ModelData object with typed access to individuals, facts, etc.
+
+        Examples:
+            >>> # Access individuals with full type safety
+            >>> # for individual in response.data.individuals:
+            >>> #     print(f"ID: {individual.id}")
+            >>> #     for type_info in individual.type:
+            >>> #         print(f"  Type: {type_info.id} - {type_info.label}")
+            ... # doctest: +SKIP
+        """
+        if self._parsed_data is None:
+            raw_data = self.raw.get("data") or {}
+            self._parsed_data = ModelData.model_validate(raw_data)
+        return self._parsed_data
+
+    @property
     def model_id(self) -> Optional[str]:
-        data = self.raw.get("data") or {}
-        return data.get("id")
+        """Get the model ID from the response."""
+        return self.data.id
 
     @property
-    def individuals(self) -> List[Dict[str, Any]]:
-        data = self.raw.get("data") or {}
-        return data.get("individuals", [])
+    def individuals(self) -> List[Individual]:
+        """Get the list of individuals from the response.
+
+        Returns:
+            List of Individual objects with typed access
+        """
+        return self.data.individuals
 
     @property
-    def facts(self) -> List[Dict[str, Any]]:
-        data = self.raw.get("data") or {}
-        return data.get("facts", [])
+    def facts(self) -> List[Fact]:
+        """Get the list of facts/edges from the response.
+
+        Returns:
+            List of Fact objects with typed access
+        """
+        return self.data.facts
 
     @property
     def model_state(self) -> Optional[str]:
         """Get the model state (e.g., 'production', 'development')."""
-        data = self.raw.get("data") or {}
-        annotations = data.get("annotations", [])
-        for annotation in annotations:
-            if annotation.get("key") == "state":
-                return annotation.get("value")
-        return None
-
-    def can_undo(self) -> bool:
-        """Check if this response can be undone.
-
-        Returns:
-            True if undo is possible, False otherwise
-        """
-        return (
-            self.ok
-            and self._original_requests is not None
-            and self._client is not None
-            and len(self._original_requests) > 0
-        )
-
-    def _generate_reverse_request(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Generate the reverse operation for a single request.
-
-        Args:
-            request: The original request to reverse
-
-        Returns:
-            The reverse request, or None if not reversible
-        """
-        entity = request.get("entity")
-        operation = request.get("operation")
-        arguments = request.get("arguments", {})
-
-        # Handle individual operations
-        if entity == "individual":
-            if operation == "add":
-                # To reverse an add, we need to find what was added
-                # This requires looking at the response to find the new individual ID
-                if self._before_state and self.raw.get("data"):
-                    before_ids = {ind["id"] for ind in self._before_state.get("individuals", [])}
-                    after_ids = {ind["id"] for ind in self.raw.get("data", {}).get("individuals", [])}
-                    new_ids = after_ids - before_ids
-                    if new_ids:
-                        # Remove the newly added individual
-                        new_id = list(new_ids)[0]  # Take first if multiple
-                        return {
-                            "entity": "individual",
-                            "operation": "remove",
-                            "arguments": {
-                                "individual": new_id,
-                                "model-id": arguments.get("model-id")
-                            }
-                        }
-            elif operation == "remove":
-                # To reverse a remove, we need the original individual's type
-                # This is harder - we'd need to have captured it before removal
-                individual_id = arguments.get("individual")
-                if self._before_state:
-                    # Find the individual that was removed
-                    for ind in self._before_state.get("individuals", []):
-                        if ind["id"] == individual_id:
-                            # Get the first type (simplification)
-                            types = ind.get("type", [])
-                            if types and len(types) > 0:
-                                class_id = types[0].get("id")
-                                if class_id:
-                                    return {
-                                        "entity": "individual",
-                                        "operation": "add",
-                                        "arguments": {
-                                            "expressions": [{"type": "class", "id": class_id}],
-                                            "model-id": arguments.get("model-id"),
-                                            "assign-to-variable": "restored"
-                                        }
-                                    }
-            elif operation == "add-annotation":
-                # To reverse adding an annotation to an individual, remove it
-                values = arguments.get("values", [])
-                if values:
-                    return {
-                        "entity": "individual",
-                        "operation": "remove-annotation",
-                        "arguments": {
-                            "model-id": arguments.get("model-id"),
-                            "individual": arguments.get("individual"),
-                            "values": values
-                        }
-                    }
-            elif operation == "remove-annotation":
-                # To reverse removing an annotation from an individual, add it back
-                values = arguments.get("values", [])
-                if values:
-                    return {
-                        "entity": "individual",
-                        "operation": "add-annotation",
-                        "arguments": {
-                            "model-id": arguments.get("model-id"),
-                            "individual": arguments.get("individual"),
-                            "values": values
-                        }
-                    }
-
-        # Handle edge/fact operations
-        elif entity == "edge":
-            if operation == "add":
-                # To reverse an add, remove the edge
-                return {
-                    "entity": "edge",
-                    "operation": "remove",
-                    "arguments": {
-                        "subject": arguments.get("subject"),
-                        "object": arguments.get("object"),
-                        "predicate": arguments.get("predicate"),
-                        "model-id": arguments.get("model-id")
-                    }
-                }
-            elif operation == "remove":
-                # To reverse a remove, add the edge back
-                return {
-                    "entity": "edge",
-                    "operation": "add",
-                    "arguments": {
-                        "subject": arguments.get("subject"),
-                        "object": arguments.get("object"),
-                        "predicate": arguments.get("predicate"),
-                        "model-id": arguments.get("model-id")
-                    }
-                }
-
-        # Handle model annotation operations
-        elif entity == "model":
-            if operation == "add-annotation":
-                # To reverse an add, remove the annotation
-                return {
-                    "entity": "model",
-                    "operation": "remove-annotation",
-                    "arguments": {
-                        "model-id": arguments.get("model-id"),
-                        "key": arguments.get("key"),
-                        "value": arguments.get("value")
-                    }
-                }
-            elif operation == "remove-annotation":
-                # To reverse a remove, add the annotation back
-                return {
-                    "entity": "model",
-                    "operation": "add-annotation",
-                    "arguments": {
-                        "model-id": arguments.get("model-id"),
-                        "key": arguments.get("key"),
-                        "value": arguments.get("value")
-                    }
-                }
-            elif operation == "replace-annotation":
-                # To reverse a replace, restore the old value
-                old_value = arguments.get("old-value")
-                new_value = arguments.get("value")
-                if old_value:
-                    return {
-                        "entity": "model",
-                        "operation": "replace-annotation",
-                        "arguments": {
-                            "model-id": arguments.get("model-id"),
-                            "key": arguments.get("key"),
-                            "value": old_value,
-                            "old-value": new_value
-                        }
-                    }
-
-        return None
-
-    def undo(self) -> 'BaristaResponse':
-        """Undo the operations that created this response.
-
-        This generates reverse operations for each request that was executed
-        and applies them to restore the previous state.
-
-        Returns:
-            BaristaResponse from the undo operation
-
-        Raises:
-            BaristaError: If undo is not possible or fails
-        """
-        if not self.can_undo():
-            raise BaristaError(
-                "Cannot undo: missing required data. "
-                "Ensure the response was created with undo support enabled."
-            )
-
-        # Generate reverse operations in reverse order
-        undo_requests = []
-        if self._original_requests:
-            for request in reversed(self._original_requests):
-                reverse_req = self._generate_reverse_request(request)
-                if reverse_req:
-                    undo_requests.append(reverse_req)
-
-        if not undo_requests:
-            raise BaristaError("No reversible operations found")
-
-        # Execute the undo operations
-        if not self._client:
-            raise BaristaError("Cannot undo: client reference is missing")
-        return self._client.m3_batch(undo_requests)
+        return self.data.get_state()
 
     def validate_individuals_detailed(self, expected: List[Dict[str, str]]) -> Dict[str, Any]:
         """Validate individuals and return detailed results including mismatches.
@@ -394,7 +294,8 @@ class BaristaResponse:
                 "error_message": "No valid response data available"
             }
 
-        individuals = self.raw.get("data", {}).get("individuals", [])
+        # Use typed Pydantic models instead of dicts
+        individuals = self.individuals
         mismatches = []
 
         for expected_item in expected:
@@ -405,21 +306,20 @@ class BaristaResponse:
             is_individual_id = expected_id and ("/" in expected_id or expected_id.startswith("gomodel:"))
 
             found = False
-            closest_matches = []
-            target_individual = None
+            closest_matches: List[TypeInfo] = []
+            target_individual: Optional[Individual] = None
             available_individual_ids: List[str] = []
 
             if is_individual_id:
                 # Individual-based validation: check if the specific individual has the expected type label
                 for individual in individuals:
-                    if individual.get("id") == expected_id:
+                    if individual.id == expected_id:
                         target_individual = individual
                         break
 
                 if target_individual:
-                    types = target_individual.get("type", [])
-                    for type_info in types:
-                        if not expected_label or type_info.get("label") == expected_label:
+                    for type_info in target_individual.type:
+                        if not expected_label or type_info.label == expected_label:
                             found = True
                             break
                         else:
@@ -428,23 +328,22 @@ class BaristaResponse:
 
                 if not target_individual:
                     # Individual ID not found
-                    available_individual_ids = [ind.get("id", "unknown") for ind in individuals]
+                    available_individual_ids = [ind.id for ind in individuals]
             else:
                 # Type-based validation: check if any individual has this type
                 for individual in individuals:
-                    types = individual.get("type", [])
-                    for type_info in types:
+                    for type_info in individual.type:
                         # Check ID match
-                        id_match = not expected_id or type_info.get("id") == expected_id
+                        id_match = not expected_id or type_info.id == expected_id
                         # Check label match
-                        label_match = not expected_label or type_info.get("label") == expected_label
+                        label_match = not expected_label or type_info.label == expected_label
 
                         if id_match and label_match:
                             found = True
                             break
 
                         # Collect potential matches for better error reporting
-                        if expected_id and type_info.get("id") == expected_id:
+                        if expected_id and type_info.id == expected_id:
                             closest_matches.append(type_info)
 
                     if found:
@@ -458,7 +357,7 @@ class BaristaResponse:
                     if target_individual:
                         # Individual exists but wrong type
                         if closest_matches:
-                            actual_labels = [t.get("label", "unknown") for t in closest_matches]
+                            actual_labels = [t.label or "unknown" for t in closest_matches]
                             mismatch_info["details"] = f"Individual {expected_id} has type labels [{', '.join(actual_labels)}] but expected '{expected_label}'"
                         else:
                             mismatch_info["details"] = f"Individual {expected_id} has no type labels but expected '{expected_label}'"
@@ -469,18 +368,18 @@ class BaristaResponse:
                     # Type-based validation failed
                     if expected_id and closest_matches:
                         actual_match = closest_matches[0]  # Take the first match
-                        mismatch_info["actual"] = actual_match
+                        mismatch_info["actual"] = {"id": actual_match.id, "label": actual_match.label}
                         if expected_label:
-                            mismatch_info["details"] = f"Expected label '{expected_label}' but found '{actual_match.get('label', 'unknown')}' for ID {expected_id}"
+                            mismatch_info["details"] = f"Expected label '{expected_label}' but found '{actual_match.label or 'unknown'}' for ID {expected_id}"
                         else:
-                            mismatch_info["details"] = f"Found ID {expected_id} with label '{actual_match.get('label', 'unknown')}'"
+                            mismatch_info["details"] = f"Found ID {expected_id} with label '{actual_match.label or 'unknown'}'"
                     else:
                         # No matching ID found at all
                         available_ids = []
                         for individual in individuals:
-                            for type_info in individual.get("type", []):
-                                if type_info.get("id"):
-                                    available_ids.append(f"{type_info['id']} ({type_info.get('label', 'no label')})")
+                            for type_info in individual.type:
+                                if type_info.id:
+                                    available_ids.append(f"{type_info.id} ({type_info.label or 'no label'})")
 
                         if expected_id:
                             mismatch_info["details"] = f"Expected ID '{expected_id}' not found. Available: {', '.join(available_ids) if available_ids else 'none'}"
@@ -514,48 +413,6 @@ class BaristaResponse:
             True if all expected types are found in individuals, False otherwise
         """
         return self.validate_individuals_detailed(expected)["valid"]
-
-    def validate_and_rollback(self, expected: List[Dict[str, str]],
-                             validation_type: str = "individuals") -> 'BaristaResponse':
-        """Validate the response and automatically rollback if validation fails.
-
-        Args:
-            expected: List of expected conditions to check
-            validation_type: Type of validation ("individuals", "facts", or custom)
-
-        Returns:
-            Self if validation passes, or undo response if validation fails
-
-        Raises:
-            BaristaError: If validation fails and undo is not possible
-        """
-        if validation_type == "individuals":
-            validation_result = self.validate_individuals_detailed(expected)
-            valid = validation_result["valid"]
-            error_message = validation_result["error_message"]
-        else:
-            # Could add more validation types here
-            raise BaristaError(f"Unknown validation type: {validation_type}")
-
-        if not valid:
-            if not self.can_undo():
-                raise BaristaError(
-                    "Validation failed but cannot undo. "
-                    "Ensure operations were executed with enable_undo=True"
-                )
-
-            # Validation failed, rollback
-            print(f"Validation failed for {validation_type}. Rolling back...")
-            undo_response = self.undo()
-
-            # Mark the undo response as a validation failure
-            undo_response.validation_failed = True
-            undo_response.validation_reason = error_message or f"Expected {validation_type} not found: {expected}"
-
-            return undo_response
-
-        # Validation passed
-        return self
 
 
 def get_noctua_url(model_id: str, token: Optional[str] = None, dev: bool = True) -> str:
@@ -617,6 +474,8 @@ class BaristaClient:
         # Variable tracking: maps (model_id, variable_name) -> actual_id
         self.track_variables = track_variables
         self._variable_registry: Dict[tuple[str, str], str] = {}
+        # For atomic batch operations: maps model_id -> {variable_name: actual_id}
+        self._variable_map: Dict[str, Dict[str, str]] = {}
         # Cache for model state before operations (for diffing)
         self._model_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -682,20 +541,14 @@ class BaristaClient:
             self._variable_registry.clear()
 
     def _snapshot_model(self, model_id: str) -> Dict[str, Any]:
-        """Take a snapshot of the current model state for diffing."""
+        """Take a snapshot of the current model state.
+
+        Returns the full data structure (not just IDs) for validation and rollback.
+        """
         response = self.get_model(model_id)
         if response.ok:
-            data = response.raw.get("data", {})
-            # Store sets of IDs for efficient diffing
-            return {
-                "individuals": {ind.get("id") for ind in data.get("individuals", []) if ind.get("id")},
-                "facts": {
-                    (f.get("subject"), f.get("object"), f.get("property"))
-                    for f in data.get("facts", [])
-                    if f.get("subject") and f.get("object") and f.get("property")
-                }
-            }
-        return {"individuals": set(), "facts": set()}
+            return response.raw.get("data", {})
+        return {"individuals": [], "facts": []}
 
     def _track_new_individual(self, model_id: str, before_state: Dict[str, Any],
                              after_response: BaristaResponse, variable: str) -> Optional[str]:
@@ -704,10 +557,13 @@ class BaristaClient:
             return None
 
         after_data = after_response.raw.get("data", {})
+
+        # Convert to sets of IDs for comparison
+        before_ids = {ind.get("id") for ind in before_state.get("individuals", []) if ind.get("id")}
         after_individuals = {ind.get("id") for ind in after_data.get("individuals", []) if ind.get("id")}
 
         # Find new individuals (in after but not in before)
-        new_individuals = after_individuals - before_state.get("individuals", set())
+        new_individuals = after_individuals - before_ids
 
         if len(new_individuals) == 1:
             # Exactly one new individual - map it to the variable
@@ -721,146 +577,376 @@ class BaristaClient:
 
         return None
 
-    def _handle_variable_tracking_for_requests(
-        self,
-        requests: List[Dict[str, Any]],
-        response: BaristaResponse,
-        before_state: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Handle variable tracking for any requests that include assign-to-variable.
-
-        This method updates the response.model_vars and internal registry.
-        Should only be called when the operation succeeded (response.ok or response.succeeded).
-
-        Args:
-            requests: The original requests that were executed
-            response: The response from the operation (must be successful)
-            before_state: Optional model snapshot taken before operation
-        """
-        if not self.track_variables or not response.ok:
-            return
-
-        # Look for requests with assign-to-variable
-        for req in requests:
-            if req.get("operation") == "add" and req.get("entity") == "individual":
-                args = req.get("arguments", {})
-                variable = args.get("assign-to-variable")
-                model_id = args.get("model-id")
-
-                if variable and model_id and before_state:
-                    # Track the new individual
-                    new_id = self._track_new_individual(model_id, before_state, response, variable)
-
-                    # Add to response.model_vars
-                    if new_id:
-                        if not hasattr(response, 'model_vars'):
-                            response.model_vars = {}
-                        response.model_vars[variable] = new_id
-
     # Low-level
-    def m3_batch(self, requests: List[Dict[str, Any]], privileged: bool = True, enable_undo: bool = False) -> BaristaResponse:
-        """Execute a batch of requests against the Minerva API.
+    def _extract_model_id(self, requests: Sequence[MinervaRequest]) -> Optional[str]:
+        """Extract model_id from the first request that has one."""
+        for req in requests:
+            if hasattr(req, 'arguments') and hasattr(req.arguments, 'model_id'):
+                return req.arguments.model_id
+        return None
 
-        Args:
-            requests: List of request dictionaries
-            privileged: Whether to use the privileged endpoint
-            enable_undo: Whether to enable undo functionality for this response
-
-        Returns:
-            BaristaResponse with optional undo support
-        """
-        # Capture before state if undo is enabled and we have a model
-        before_state = None
-        if enable_undo and requests:
-            # Try to extract model_id from first request
-            model_id = None
-            for req in requests:
-                model_id = req.get("arguments", {}).get("model-id")
-                if model_id:
-                    break
-            if model_id:
-                try:
-                    before_resp = self.get_model(model_id)
-                    if before_resp.ok:
-                        before_state = before_resp.raw.get("data")
-                except Exception:
-                    # If we can't get before state, undo won't work but operation continues
-                    pass
+    def _execute_single_request(
+        self,
+        req: MinervaRequest,
+        privileged: bool
+    ) -> BaristaResponse:
+        """Execute a single request and return response."""
+        dict_request = req.model_dump(by_alias=True, exclude_none=True)
 
         url = self.privileged_url if privileged else self.batch_url
         data = {
             "intention": "action",
             "token": self.token,
             "provided-by": self.provided_by,
-            "requests": json.dumps(requests),  # stringified per Barista expectations
+            "requests": json.dumps([dict_request]),
         }
         resp = self._client.post(url, data=data)
         resp.raise_for_status()
         raw = resp.json()
 
-        # Create response with undo support if enabled
-        if enable_undo:
-            return BaristaResponse(
-                raw=raw,
-                _original_requests=requests.copy(),
-                _client=self,
-                _before_state=before_state
-            )
+        return BaristaResponse(raw=raw)
+
+    def _validate_individual_label(
+        self,
+        before_state: Dict[str, Any],
+        after_state: Dict[str, Any],
+        expected_label: str
+    ) -> Optional[str]:
+        """Validate that the created individual has the expected label.
+
+        Returns:
+            Error message if validation fails, None if passes
+        """
+        # Find newly created individual
+        before_ids = {ind["id"] for ind in before_state.get("individuals", [])}
+        after_individuals = after_state.get("individuals", [])
+
+        new_individuals = [ind for ind in after_individuals if ind["id"] not in before_ids]
+
+        if not new_individuals:
+            return "No new individual was created"
+
+        new_individual = new_individuals[0]
+
+        # Check if any type has the expected label
+        types = new_individual.get("type", [])
+        for type_info in types:
+            if type_info.get("label") == expected_label:
+                return None  # Validation passed!
+
+        # Validation failed
+        actual_labels = [t.get("label", "?") for t in types]
+        return f"Expected label '{expected_label}', but got {actual_labels}"
+
+    def _rollback_executed_requests(
+        self,
+        executed_requests: List[Tuple[MinervaRequest, Dict, Dict]],
+        privileged: bool = True
+    ) -> BaristaResponse:
+        """Rollback executed requests using their reverse operations.
+
+        Args:
+            executed_requests: List of (request, before_state, after_state) tuples
+            privileged: Whether to use privileged endpoint for rollback
+
+        Returns:
+            BaristaResponse from executing the rollback
+        """
+        undo_requests = []
+
+        # Generate reverses in reverse order
+        for req, before_state, after_state in reversed(executed_requests):
+            reverse_req = req.reverse(before_state, after_state)
+            if reverse_req:
+                undo_requests.append(reverse_req)
+            else:
+                logger.warning(f"Could not generate reverse for {req.__class__.__name__}")
+
+        # Execute rollback (simple batch, no validation)
+        if undo_requests:
+            return self._execute_simple_batch(undo_requests, privileged=privileged)
         else:
-            return BaristaResponse(raw=raw)
+            return BaristaResponse(raw={"message-type": "success", "message": "Rollback complete (no-op)"})
+
+    def _execute_simple_batch(
+        self,
+        requests: Sequence[MinervaRequest],
+        privileged: bool
+    ) -> BaristaResponse:
+        """Execute requests as a simple batch - no validation, no rollback."""
+        dict_requests = [req.model_dump(by_alias=True, exclude_none=True) for req in requests]
+
+        url = self.privileged_url if privileged else self.batch_url
+        data = {
+            "intention": "action",
+            "token": self.token,
+            "provided-by": self.provided_by,
+            "requests": json.dumps(dict_requests),
+        }
+        resp = self._client.post(url, data=data)
+        resp.raise_for_status()
+        raw = resp.json()
+
+        return BaristaResponse(raw=raw)
+
+    def _track_variable_for_request(
+        self,
+        req: AddIndividualRequest,
+        before_state: Dict[str, Any],
+        after_state: Dict[str, Any]
+    ) -> None:
+        """Track variable assignment for an AddIndividual request."""
+        variable = req.arguments.assign_to_variable
+        if not variable:
+            return
+
+        model_id = req.arguments.model_id
+
+        # Find the newly created individual
+        before_ids = {ind["id"] for ind in before_state.get("individuals", [])}
+        after_individuals = after_state.get("individuals", [])
+
+        new_individuals = [ind for ind in after_individuals if ind["id"] not in before_ids]
+        if new_individuals:
+            new_id = new_individuals[0]["id"]
+
+            # Store in both variable tracking systems
+            self._variable_registry[(model_id, variable)] = new_id
+            if model_id not in self._variable_map:
+                self._variable_map[model_id] = {}
+            self._variable_map[model_id][variable] = new_id
+
+    def m3_batch(
+        self,
+        requests: Sequence[MinervaRequest],
+        privileged: bool = True
+    ) -> BaristaResponse:
+        """Execute requests atomically with automatic validation and rollback.
+
+        Behavior:
+        - If ANY request needs validation: executes ONE AT A TIME with rollback
+        - If NO validation needed: sends all requests together (Barista handles variables)
+        - For AddIndividual requests with expected_label: validates after creation
+        - On ANY failure (API or validation): rolls back ALL executed requests
+        - Variable tracking happens after each successful validated request
+
+        Args:
+            requests: List of Pydantic request models
+            privileged: Whether to use the privileged endpoint
+
+        Returns:
+            BaristaResponse - either success or rollback response
+            Check response.validation_failed to determine if rollback occurred
+
+        Examples:
+            >>> # Single request with validation
+            >>> # req = BaristaClient.req_add_individual(
+            >>> #     "gomodel:123", "GO:0003924", "x1",
+            >>> #     expected_label="GTPase activity"
+            >>> # )
+            >>> # response = client.m3_batch([req])
+            >>> # if response.validation_failed:
+            >>> #     print(f"Rolled back: {response.validation_reason}")
+            ... # doctest: +SKIP
+        """
+        # Check if any request needs validation
+        needs_validation = any(
+            isinstance(req, AddIndividualRequest) and req.arguments.expected_label
+            for req in requests
+        )
+
+        # If no validation needed, use simple batch (Barista handles variables)
+        if not needs_validation:
+            return self._execute_simple_batch(requests, privileged)
+
+        # Extract model_id for validation/rollback mode
+        model_id = self._extract_model_id(requests)
+        if not model_id:
+            # No model_id found, fall back to simple batch execution
+            return self._execute_simple_batch(requests, privileged)
+
+        # Track what we've executed for rollback
+        executed_requests: List[Tuple[MinervaRequest, Dict, Dict]] = []
+
+        # Take initial variable snapshot for rollback
+        initial_variables = copy.deepcopy(self._variable_map.get(model_id, {}))
+
+        # For accumulating the final response
+        final_response = None
+
+        try:
+            for i, req in enumerate(requests):
+                # Take before snapshot for this request
+                before_snapshot = self._snapshot_model(model_id)
+
+                # Execute single request
+                single_response = self._execute_single_request(req, privileged)
+
+                # Get after state
+                after_state = single_response.raw.get("data", {})
+
+                # Check if API call failed
+                if not single_response.ok:
+                    raise BatchExecutionError(
+                        f"Request {i+1}/{len(requests)} failed: {single_response.error}",
+                        executed_requests=[r for r, _, _ in executed_requests],
+                        failed_request=req,
+                        failed_response=single_response
+                    )
+
+                # VALIDATION (for AddIndividual with expected_label)
+                if isinstance(req, AddIndividualRequest):
+                    expected_label = req.arguments.expected_label
+                    if expected_label:
+                        validation_error = self._validate_individual_label(
+                            before_snapshot, after_state, expected_label
+                        )
+                        if validation_error:
+                            raise BatchValidationError(
+                                f"Request {i+1}/{len(requests)} validation failed: {validation_error}",
+                                executed_requests=[r for r, _, _ in executed_requests] + [req],
+                                failed_request=req,
+                                validation_reason=validation_error
+                            )
+
+                    # VARIABLE TRACKING (after successful validation or no validation)
+                    if self.track_variables and req.arguments.assign_to_variable:
+                        self._track_variable_for_request(req, before_snapshot, after_state)
+
+                # Track this execution
+                executed_requests.append((req, before_snapshot, after_state))
+                final_response = single_response
+
+            # ALL SUCCESSFUL
+            if final_response is None:
+                # No requests were executed - return a success response
+                return BaristaResponse(raw={"message-type": "success", "message": "No requests executed"})
+            return final_response
+
+        except (BatchExecutionError, BatchValidationError) as e:
+            # ROLLBACK ALL EXECUTED REQUESTS
+            logger.error(f"Batch execution failed: {e}")
+            logger.info(f"Rolling back {len(executed_requests)} request(s)...")
+
+            rollback_response = self._rollback_executed_requests(executed_requests, privileged=privileged)
+
+            # RESTORE VARIABLES
+            if self.track_variables:
+                self._variable_map[model_id] = initial_variables
+
+            # Mark as failed with details
+            rollback_response.validation_failed = True
+            rollback_response.validation_reason = str(e)
+            rollback_response.failed_request_index = len(executed_requests) - 1
+
+            return rollback_response
 
     # Builders
     @staticmethod
-    def req_add_individual(model_id: str, class_id: str, assign_var: str = "x1") -> Dict[str, Any]:
-        return {
-            "entity": "individual",
-            "operation": "add",
-            "arguments": {
-                "expressions": [{"type": "class", "id": class_id}],
-                "model-id": model_id,
-                "assign-to-variable": assign_var,
-            },
-        }
+    def req_add_individual(
+        model_id: str,
+        class_id: str,
+        assign_var: str = "x1",
+        expected_label: Optional[str] = None
+    ) -> AddIndividualRequest:
+        """Build a request to add an individual to a model.
+
+        Args:
+            model_id: The model ID
+            class_id: The class/type CURIE (e.g., "GO:0003924")
+            assign_var: Variable name to assign
+            expected_label: If provided, validates the created individual has this label
+
+        Returns:
+            AddIndividualRequest object
+
+        Examples:
+            >>> # Without validation
+            >>> req = BaristaClient.req_add_individual("gomodel:123", "GO:0003924", "activity1")
+            >>> req.entity
+            'individual'
+            >>> req.operation
+            'add'
+
+            >>> # With validation
+            >>> req = BaristaClient.req_add_individual(
+            ...     "gomodel:123", "GO:0003924", "activity1",
+            ...     expected_label="GTPase activity"
+            ... )
+            >>> req.arguments.expected_label
+            'GTPase activity'
+        """
+        return AddIndividualRequest(
+            arguments=AddIndividualArguments(
+                expressions=[Expression(type="class", id=class_id)],
+                model_id=model_id,
+                assign_to_variable=assign_var,
+                expected_label=expected_label
+            )
+        )
 
     @staticmethod
-    def req_remove_individual(model_id: str, individual_id: str) -> Dict[str, Any]:
-        return {
-            "entity": "individual",
-            "operation": "remove",
-            "arguments": {
-                "individual": individual_id,
-                "model-id": model_id,
-            },
-        }
+    def req_remove_individual(model_id: str, individual_id: str) -> RemoveIndividualRequest:
+        """Build a request to remove an individual from a model.
+
+        Examples:
+            >>> req = BaristaClient.req_remove_individual("gomodel:123", "gomodel:123/individual-456")
+            >>> req.entity
+            'individual'
+            >>> req.operation
+            'remove'
+        """
+        return RemoveIndividualRequest(
+            arguments=RemoveIndividualArguments(
+                individual=individual_id,
+                model_id=model_id
+            )
+        )
 
     @staticmethod
-    def req_add_fact(model_id: str, subject_id: str, object_id: str, predicate_id: str) -> Dict[str, Any]:
-        return {
-            "entity": "edge",
-            "operation": "add",
-            "arguments": {
-                "subject": subject_id,
-                "object": object_id,
-                "predicate": predicate_id,
-                "model-id": model_id,
-            },
-        }
+    def req_add_fact(model_id: str, subject_id: str, object_id: str, predicate_id: str) -> AddEdgeRequest:
+        """Build a request to add an edge (fact) between individuals.
+
+        Examples:
+            >>> req = BaristaClient.req_add_fact("gomodel:123", "ind1", "ind2", "RO:0002413")
+            >>> req.entity
+            'edge'
+            >>> req.operation
+            'add'
+        """
+        return AddEdgeRequest(
+            arguments=AddEdgeArguments(
+                subject=subject_id,
+                object=object_id,
+                predicate=predicate_id,
+                model_id=model_id
+            )
+        )
 
     @staticmethod
-    def req_remove_fact(model_id: str, subject_id: str, object_id: str, predicate_id: str) -> Dict[str, Any]:
-        return {
-            "entity": "edge",
-            "operation": "remove",
-            "arguments": {
-                "subject": subject_id,
-                "object": object_id,
-                "predicate": predicate_id,
-                "model-id": model_id,
-            },
-        }
+    def req_remove_fact(model_id: str, subject_id: str, object_id: str, predicate_id: str) -> RemoveEdgeRequest:
+        """Build a request to remove an edge (fact) between individuals.
+
+        Examples:
+            >>> req = BaristaClient.req_remove_fact("gomodel:123", "ind1", "ind2", "RO:0002413")
+            >>> req.entity
+            'edge'
+            >>> req.operation
+            'remove'
+        """
+        return RemoveEdgeRequest(
+            arguments=RemoveEdgeArguments(
+                subject=subject_id,
+                object=object_id,
+                predicate=predicate_id,
+                model_id=model_id
+            )
+        )
 
     @staticmethod
-    def req_update_model_annotation(model_id: str, key: str, value: str, old_value: Optional[str] = None) -> Dict[str, Any]:
+    def req_update_model_annotation(
+        model_id: str, key: str, value: str, old_value: Optional[str] = None
+    ) -> Union[AddModelAnnotationRequest, ReplaceModelAnnotationRequest]:
         """Request to update a model annotation.
 
         Args:
@@ -870,30 +956,33 @@ class BaristaClient:
             old_value: The current value (optional, for replacement)
 
         Returns:
-            Request dictionary for updating model annotation
+            AddModelAnnotationRequest or ReplaceModelAnnotationRequest
+
+        Examples:
+            >>> req = BaristaClient.req_update_model_annotation("gomodel:123", "title", "New Title")
+            >>> req.entity
+            'model'
+            >>> req.operation
+            'add-annotation'
         """
         # If old_value is provided, this is a replace operation
         if old_value is not None:
-            return {
-                "entity": "model",
-                "operation": "replace-annotation",
-                "arguments": {
-                    "model-id": model_id,
-                    "key": key,
-                    "old-value": old_value,
-                    "new-value": value,
-                }
-            }
+            return ReplaceModelAnnotationRequest(
+                arguments=ReplaceModelAnnotationArguments(
+                    model_id=model_id,
+                    key=key,
+                    old_value=old_value,
+                    new_value=value
+                )
+            )
         else:
             # Otherwise, it's an add operation using values array format
-            return {
-                "entity": "model",
-                "operation": "add-annotation",
-                "arguments": {
-                    "model-id": model_id,
-                    "values": [{"key": key, "value": value}]
-                }
-            }
+            return AddModelAnnotationRequest(
+                arguments=AddModelAnnotationArguments(
+                    model_id=model_id,
+                    values=[AnnotationValue(key=key, value=value)]
+                )
+            )
 
     @staticmethod
     def req_update_individual_annotation(
@@ -902,7 +991,7 @@ class BaristaClient:
         key: str,
         value: str,
         old_value: Optional[str] = None
-    ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+    ) -> Union[AddIndividualAnnotationRequest, List[Union[RemoveIndividualAnnotationRequest, AddIndividualAnnotationRequest]]]:
         """Request to update an annotation on an individual.
 
         Args:
@@ -913,43 +1002,44 @@ class BaristaClient:
             old_value: The current value (optional, for replacement)
 
         Returns:
-            Request dictionary (or list of requests) for updating individual annotation
+            AddIndividualAnnotationRequest or list of [RemoveIndividualAnnotationRequest, AddIndividualAnnotationRequest]
+
+        Examples:
+            >>> req = BaristaClient.req_update_individual_annotation("gomodel:123", "ind1", "label", "New Label")
+            >>> req.entity
+            'individual'
+            >>> req.operation
+            'add-annotation'
         """
         if old_value is not None:
             # Replace operation: remove old and add new
             # Since there's no replace-annotation for individuals,
             # we need to do this as two operations
             return [
-                {
-                    "entity": "individual",
-                    "operation": "remove-annotation",
-                    "arguments": {
-                        "model-id": model_id,
-                        "individual": individual_id,
-                        "values": [{"key": key, "value": old_value}]
-                    }
-                },
-                {
-                    "entity": "individual",
-                    "operation": "add-annotation",
-                    "arguments": {
-                        "model-id": model_id,
-                        "individual": individual_id,
-                        "values": [{"key": key, "value": value}]
-                    }
-                }
+                RemoveIndividualAnnotationRequest(
+                    arguments=RemoveIndividualAnnotationArguments(
+                        model_id=model_id,
+                        individual=individual_id,
+                        values=[AnnotationValue(key=key, value=old_value)]
+                    )
+                ),
+                AddIndividualAnnotationRequest(
+                    arguments=AddIndividualAnnotationArguments(
+                        model_id=model_id,
+                        individual=individual_id,
+                        values=[AnnotationValue(key=key, value=value)]
+                    )
+                )
             ]
         else:
             # Add operation
-            return {
-                "entity": "individual",
-                "operation": "add-annotation",
-                "arguments": {
-                    "model-id": model_id,
-                    "individual": individual_id,
-                    "values": [{"key": key, "value": value}]
-                }
-            }
+            return AddIndividualAnnotationRequest(
+                arguments=AddIndividualAnnotationArguments(
+                    model_id=model_id,
+                    individual=individual_id,
+                    values=[AnnotationValue(key=key, value=value)]
+                )
+            )
 
     @staticmethod
     def req_remove_individual_annotation(
@@ -957,7 +1047,7 @@ class BaristaClient:
         individual_id: str,
         key: str,
         value: str
-    ) -> Dict[str, Any]:
+    ) -> RemoveIndividualAnnotationRequest:
         """Request to remove an annotation from an individual.
 
         Args:
@@ -967,20 +1057,25 @@ class BaristaClient:
             value: The value to remove
 
         Returns:
-            Request dictionary for removing individual annotation
+            RemoveIndividualAnnotationRequest
+
+        Examples:
+            >>> req = BaristaClient.req_remove_individual_annotation("gomodel:123", "ind1", "label", "Old Label")
+            >>> req.entity
+            'individual'
+            >>> req.operation
+            'remove-annotation'
         """
-        return {
-            "entity": "individual",
-            "operation": "remove-annotation",
-            "arguments": {
-                "model-id": model_id,
-                "individual": individual_id,
-                "values": [{"key": key, "value": value}]
-            }
-        }
+        return RemoveIndividualAnnotationRequest(
+            arguments=RemoveIndividualAnnotationArguments(
+                model_id=model_id,
+                individual=individual_id,
+                values=[AnnotationValue(key=key, value=value)]
+            )
+        )
 
     @staticmethod
-    def req_remove_model_annotation(model_id: str, key: str, value: str) -> Dict[str, Any]:
+    def req_remove_model_annotation(model_id: str, key: str, value: str) -> RemoveModelAnnotationRequest:
         """Request to remove a model annotation.
 
         Args:
@@ -989,16 +1084,21 @@ class BaristaClient:
             value: The value to remove (required for multi-value keys)
 
         Returns:
-            Request dictionary for removing model annotation
+            RemoveModelAnnotationRequest
+
+        Examples:
+            >>> req = BaristaClient.req_remove_model_annotation("gomodel:123", "title", "Old Title")
+            >>> req.entity
+            'model'
+            >>> req.operation
+            'remove-annotation'
         """
-        return {
-            "entity": "model",
-            "operation": "remove-annotation",
-            "arguments": {
-                "model-id": model_id,
-                "values": [{"key": key, "value": value}]
-            }
-        }
+        return RemoveModelAnnotationRequest(
+            arguments=RemoveModelAnnotationArguments(
+                model_id=model_id,
+                values=[AnnotationValue(key=key, value=value)]
+            )
+        )
 
     @staticmethod
     def req_add_evidence_to_fact(
@@ -1009,106 +1109,126 @@ class BaristaClient:
         eco_id: str,
         sources: List[str],
         with_from: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[MinervaRequest]:
         """
         Compose the three-step evidence add sequence:
         1) add evidence individual
         2) add source (+ with) to evidence individual
         3) add evidence annotation to the edge
 
-        Returns a list of requests that can be appended into the batch.
+        Returns a list of Pydantic request models that can be appended into the batch.
         """
+        from .models import (
+            AddIndividualRequest,
+            AddIndividualArguments,
+            AddIndividualAnnotationRequest,
+            AddIndividualAnnotationArguments,
+            AddEdgeAnnotationRequest,
+            AddEdgeAnnotationArguments,
+            Expression,
+            AnnotationValue,
+        )
+
         ev_var = "e1"
-        reqs: List[Dict[str, Any]] = []
+        reqs: List[MinervaRequest] = []
+
         # 1) evidence individual
         reqs.append(
-            {
-                "entity": "individual",
-                "operation": "add",
-                "arguments": {
-                    "expressions": [{"type": "class", "id": eco_id}],
-                    "model-id": model_id,
-                    "assign-to-variable": ev_var,
-                },
-            }
+            AddIndividualRequest(
+                arguments=AddIndividualArguments(
+                    expressions=[Expression(type="class", id=eco_id)],
+                    model_id=model_id,
+                    assign_to_variable=ev_var,
+                    expected_label=None,
+                )
+            )
         )
+
         # 2) add annotations to evidence individual
-        values = [{"key": "source", "value": s} for s in sources]
+        values = [AnnotationValue(key="source", value=s) for s in sources]
         if with_from:
-            values.extend({"key": "with", "value": w} for w in with_from)
+            values.extend([AnnotationValue(key="with", value=w) for w in with_from])
+
         reqs.append(
-            {
-                "entity": "individual",
-                "operation": "add-annotation",
-                "arguments": {
-                    "individual": ev_var,
-                    "values": values,
-                    "model-id": model_id,
-                },
-            }
+            AddIndividualAnnotationRequest(
+                arguments=AddIndividualAnnotationArguments(
+                    individual=ev_var,
+                    values=values,
+                    model_id=model_id,
+                )
+            )
         )
+
         # 3) tie evidence to edge
         reqs.append(
-            {
-                "entity": "edge",
-                "operation": "add-annotation",
-                "arguments": {
-                    "subject": subject_id,
-                    "object": object_id,
-                    "predicate": predicate_id,
-                    "values": [{"key": "evidence", "value": ev_var}],
-                    "model-id": model_id,
-                },
-            }
+            AddEdgeAnnotationRequest(
+                arguments=AddEdgeAnnotationArguments(
+                    subject=subject_id,
+                    object=object_id,
+                    predicate=predicate_id,
+                    values=[AnnotationValue(key="evidence", value=ev_var)],
+                    model_id=model_id,
+                )
+            )
         )
         return reqs
 
     @staticmethod
-    def req_create_model(title: Optional[str] = None) -> Dict[str, Any]:
+    def req_create_model(title: Optional[str] = None) -> CreateModelRequest:
         """Request to create a new empty model.
 
         Args:
             title: Optional title for the model
 
         Returns:
-            Request dictionary for model creation
+            CreateModelRequest
+
+        Examples:
+            >>> req = BaristaClient.req_create_model("My Model")
+            >>> req.entity
+            'model'
+            >>> req.operation
+            'add'
         """
-        arguments = {}
-        if title:
-            # Add title as an annotation value
-            arguments["values"] = [{"key": "title", "value": title}]
-        return {
-            "entity": "model",
-            "operation": "add",
-            "arguments": arguments,
-        }
+        return CreateModelRequest(
+            arguments=CreateModelArguments(
+                values=[AnnotationValue(key="title", value=title)] if title else None
+            )
+        )
 
     @staticmethod
-    def req_get_model(model_id: str) -> Dict[str, Any]:
-        return {
-            "entity": "model",
-            "operation": "get",
-            "arguments": {
-                "model-id": model_id,
-            },
-        }
+    def req_get_model(model_id: str) -> GetModelRequest:
+        """Request to get a model.
+
+        Examples:
+            >>> req = BaristaClient.req_get_model("gomodel:123")
+            >>> req.entity
+            'model'
+            >>> req.operation
+            'get'
+        """
+        return GetModelRequest(
+            arguments=GetModelArguments(model_id=model_id)
+        )
 
     @staticmethod
-    def req_export_model(model_id: str, format: str = "owl") -> Dict[str, Any]:
+    def req_export_model(model_id: str, format: str = "owl") -> ExportModelRequest:
         """Request to export a model in a specific format.
 
         Args:
             model_id: The model to export
             format: Export format (owl, ttl, json-ld, etc.)
+
+        Examples:
+            >>> req = BaristaClient.req_export_model("gomodel:123", "owl")
+            >>> req.entity
+            'model'
+            >>> req.operation
+            'export'
         """
-        return {
-            "entity": "model",
-            "operation": "export",
-            "arguments": {
-                "model-id": model_id,
-                "format": format,
-            },
-        }
+        return ExportModelRequest(
+            arguments=ExportModelArguments(model_id=model_id, format=format)
+        )
 
 
     # High-level convenience
@@ -1124,34 +1244,43 @@ class BaristaClient:
         req = self.req_create_model(title)
         return self.m3_batch([req])
 
-    def add_individual(self, model_id: str, class_curie: str, assign_var: str = "x1", enable_undo: bool = False) -> BaristaResponse:
-        """Add an individual to the model and optionally track its variable.
+    def add_individual(
+        self,
+        model_id: str,
+        class_curie: str,
+        assign_var: str = "x1",
+        expected_label: Optional[str] = None
+    ) -> BaristaResponse:
+        """Add an individual to the model.
 
-        If track_variables is enabled, this will diff the model before/after
-        to identify the new individual and map it to the variable name.
+        Validation and variable tracking happen automatically in m3_batch.
 
         Args:
             model_id: The model ID
             class_curie: The class/type for the individual (e.g., "GO:0003924")
-            assign_var: Variable name to assign (if track_variables is enabled)
-            enable_undo: If True, the returned response will support undo()
+            assign_var: Variable name to assign
+            expected_label: If provided, validates the individual has this label
+                           and rolls back if validation fails
 
         Returns:
-            BaristaResponse that may support undo() if enable_undo=True
+            BaristaResponse - check .validation_failed for rollback status
+
+        Examples:
+            >>> # Simple add (no validation)
+            >>> # response = client.add_individual("gomodel:123", "GO:0003924", "kinase")
+            ... # doctest: +SKIP
+
+            >>> # Add with validation (safe)
+            >>> # response = client.add_individual(
+            >>> #     "gomodel:123", "GO:0003924", "kinase",
+            >>> #     expected_label="GTPase activity"
+            >>> # )
+            >>> # if response.validation_failed:
+            >>> #     print("Wrong label! Rolled back.")
+            ... # doctest: +SKIP
         """
-        # Take snapshot before operation if tracking is enabled
-        before_state = None
-        if self.track_variables and assign_var:
-            before_state = self._snapshot_model(model_id)
-
-        req = self.req_add_individual(model_id, class_curie, assign_var)
-        response = self.m3_batch([req], enable_undo=enable_undo)
-
-        # Handle variable tracking if successful
-        if response.ok and before_state:
-            self._handle_variable_tracking_for_requests([req], response, before_state)
-
-        return response
+        req = self.req_add_individual(model_id, class_curie, assign_var, expected_label)
+        return self.m3_batch([req])
 
     def remove_individual(self, model_id: str, individual_id: str) -> BaristaResponse:
         """Remove an individual, resolving variables to actual IDs."""
@@ -1175,7 +1304,7 @@ class BaristaClient:
         return self.remove_individual(model_id, individual_id)
 
     def add_fact(
-        self, model_id: str, subject_id: str, object_id: str, predicate_id: str, enable_undo: bool = False
+        self, model_id: str, subject_id: str, object_id: str, predicate_id: str
     ) -> BaristaResponse:
         """Add a fact (edge) between two individuals.
 
@@ -1191,26 +1320,25 @@ class BaristaClient:
             subject_id: Subject individual (variable, CURIE, or ID)
             object_id: Object individual (variable, CURIE, or ID)
             predicate_id: The relation/predicate (e.g., "RO:0002413")
-            enable_undo: If True, the returned response will support undo()
 
         Returns:
-            BaristaResponse that may support undo() if enable_undo=True
+            BaristaResponse
         """
         # Resolve variables to actual IDs
         resolved_subject = self._resolve_identifier(model_id, subject_id)
         resolved_object = self._resolve_identifier(model_id, object_id)
 
         req = self.req_add_fact(model_id, resolved_subject, resolved_object, predicate_id)
-        return self.m3_batch([req], enable_undo=enable_undo)
+        return self.m3_batch([req])
 
     def remove_fact(
-        self, model_id: str, subject_id: str, object_id: str, predicate_id: str, enable_undo: bool = False
+        self, model_id: str, subject_id: str, object_id: str, predicate_id: str
     ) -> BaristaResponse:
         """Remove a fact, resolving variables to actual IDs."""
         resolved_subject = self._resolve_identifier(model_id, subject_id)
         resolved_object = self._resolve_identifier(model_id, object_id)
         req = self.req_remove_fact(model_id, resolved_subject, resolved_object, predicate_id)
-        return self.m3_batch([req], enable_undo=enable_undo)
+        return self.m3_batch([req])
 
     def delete_edge(
         self, model_id: str, subject_id: str, object_id: str, predicate_id: str
@@ -1240,7 +1368,6 @@ class BaristaClient:
         eco_id: str,
         sources: List[str],
         with_from: Optional[List[str]] = None,
-        enable_undo: bool = False,
     ) -> BaristaResponse:
         """Add a fact with evidence, resolving variables to actual IDs.
 
@@ -1250,17 +1377,236 @@ class BaristaClient:
         resolved_subject = self._resolve_identifier(model_id, subject_id)
         resolved_object = self._resolve_identifier(model_id, object_id)
 
-        reqs = [self.req_add_fact(model_id, resolved_subject, resolved_object, predicate_id)]
+        reqs: List[MinervaRequest] = [self.req_add_fact(model_id, resolved_subject, resolved_object, predicate_id)]
         reqs.extend(
             self.req_add_evidence_to_fact(
                 model_id, resolved_subject, resolved_object, predicate_id, eco_id, sources, with_from
             )
         )
-        return self.m3_batch(reqs, enable_undo=enable_undo)
+        return self.m3_batch(reqs)
+
+    def add_protein_complex(
+        self,
+        model_id: str,
+        components: List[ProteinComplexComponent],
+        complex_class: str = "GO:0032991",  # protein-containing complex
+        assign_var: str = "complex1",
+        expected_label: Optional[str] = None,
+    ) -> BaristaResponse:
+        """Add a protein complex with its components.
+
+        This is a higher-level method that creates a protein-containing complex
+        and links its components using 'has part' relationships.
+
+        Args:
+            model_id: The model ID
+            components: List of ProteinComplexComponent instances
+            complex_class: The complex class CURIE (default: GO:0032991 for protein-containing complex)
+            assign_var: Variable name for the complex
+            expected_label: If provided, validates the complex has this label
+
+        Returns:
+            BaristaResponse - The complex individual is created first,
+                             then components are linked with 'has part' relationships
+
+        Examples:
+            >>> from noctua.models import ProteinComplexComponent
+            >>> # Simple protein complex with two components
+            >>> # components = [
+            >>> #     ProteinComplexComponent(entity_id="UniProtKB:P12345", label="Protein A"),
+            >>> #     ProteinComplexComponent(entity_id="UniProtKB:P67890", label="Protein B")
+            >>> # ]
+            >>> # response = client.add_protein_complex("gomodel:123", components)
+            ... # doctest: +SKIP
+
+            >>> # Complex with evidence
+            >>> # components = [
+            >>> #     ProteinComplexComponent(
+            >>> #         entity_id="UniProtKB:P12345",
+            >>> #         label="Ras protein",
+            >>> #         evidence_type="ECO:0000314",
+            >>> #         reference="PMID:12345678"
+            >>> #     )
+            >>> # ]
+            >>> # response = client.add_protein_complex(
+            >>> #     "gomodel:123",
+            >>> #     components,
+            >>> #     expected_label="Ras signaling complex"
+            >>> # )
+            ... # doctest: +SKIP
+        """
+        if not components:
+            raise BaristaError("At least one component is required")
+
+        requests: List[MinervaRequest] = []
+
+        # 1. Create the complex individual
+        requests.append(
+            self.req_add_individual(model_id, complex_class, assign_var, expected_label)
+        )
+
+        # 2. Create individuals for each component and link them
+        has_part_predicate = "BFO:0000051"  # has part
+
+        for i, component in enumerate(components):
+            entity_id = component.entity_id
+            label = component.label
+            evidence_type = component.evidence_type
+            reference = component.reference
+
+            # Create component individual
+            component_var = f"component{i+1}"
+            requests.append(
+                self.req_add_individual(model_id, entity_id, component_var)
+            )
+
+            # Add label annotation if provided
+            if label:
+                label_req = self.req_update_individual_annotation(
+                    model_id, component_var, "rdfs:label", label
+                )
+                # req_update_individual_annotation returns either a single request or a list
+                if isinstance(label_req, list):
+                    requests.extend(label_req)
+                else:
+                    requests.append(label_req)
+
+            # Link component to complex with 'has part'
+            requests.append(
+                self.req_add_fact(model_id, assign_var, component_var, has_part_predicate)
+            )
+
+            # Add evidence to the 'has part' relationship if provided
+            if evidence_type and reference:
+                requests.extend(
+                    self.req_add_evidence_to_fact(
+                        model_id,
+                        assign_var,
+                        component_var,
+                        has_part_predicate,
+                        evidence_type,
+                        [reference],
+                        None
+                    )
+                )
+
+        return self.m3_batch(requests)
+
+    def add_entity_set(
+        self,
+        model_id: str,
+        members: List[EntitySetMember],
+        set_class: str = "CHEBI:33695",  # information biomacromolecule
+        assign_var: str = "set1",
+        expected_label: Optional[str] = None,
+    ) -> BaristaResponse:
+        """Add an entity set with functionally interchangeable members.
+
+        This is a higher-level method that creates an entity set (typically for
+        paralogy groups) and links its members using 'has substitutable entity'
+        relationships.
+
+        Args:
+            model_id: The model ID
+            members: List of EntitySetMember instances
+            set_class: The set class CURIE (default: CHEBI:33695 for information biomacromolecule)
+            assign_var: Variable name for the set
+            expected_label: If provided, validates the set has this label
+
+        Returns:
+            BaristaResponse - The set individual is created first,
+                             then members are linked with 'has substitutable entity' relationships
+
+        Examples:
+            >>> from noctua.models import EntitySetMember
+            >>> # Simple entity set with two paralogs (e.g., ERK1/ERK2)
+            >>> # members = [
+            >>> #     EntitySetMember(entity_id="UniProtKB:P27361", label="MAPK3 (ERK1)"),
+            >>> #     EntitySetMember(entity_id="UniProtKB:P28482", label="MAPK1 (ERK2)")
+            >>> # ]
+            >>> # response = client.add_entity_set("gomodel:123", members)
+            ... # doctest: +SKIP
+
+            >>> # Entity set with evidence
+            >>> # members = [
+            >>> #     EntitySetMember(
+            >>> #         entity_id="UniProtKB:P27361",
+            >>> #         label="MAPK3 (ERK1)",
+            >>> #         evidence_type="ECO:0000314",
+            >>> #         reference="PMID:12345678"
+            >>> #     )
+            >>> # ]
+            >>> # response = client.add_entity_set(
+            >>> #     "gomodel:123",
+            >>> #     members,
+            >>> #     expected_label="ERK paralogy group"
+            >>> # )
+            ... # doctest: +SKIP
+        """
+        if not members:
+            raise BaristaError("At least one member is required")
+
+        requests: List[MinervaRequest] = []
+
+        # 1. Create the set individual
+        requests.append(
+            self.req_add_individual(model_id, set_class, assign_var, expected_label)
+        )
+
+        # 2. Create individuals for each member and link them
+        has_substitutable_entity_predicate = "RO:0019003"  # has substitutable entity
+
+        for i, member in enumerate(members):
+            entity_id = member.entity_id
+            label = member.label
+            evidence_type = member.evidence_type
+            reference = member.reference
+
+            # Create member individual
+            member_var = f"member{i+1}"
+            requests.append(
+                self.req_add_individual(model_id, entity_id, member_var)
+            )
+
+            # Add label annotation if provided
+            if label:
+                label_req = self.req_update_individual_annotation(
+                    model_id, member_var, "rdfs:label", label
+                )
+                # req_update_individual_annotation returns either a single request or a list
+                if isinstance(label_req, list):
+                    requests.extend(label_req)
+                else:
+                    requests.append(label_req)
+
+            # Link member to set with 'has substitutable entity'
+            requests.append(
+                self.req_add_fact(model_id, assign_var, member_var, has_substitutable_entity_predicate)
+            )
+
+            # Add evidence to the relationship if provided
+            if evidence_type and reference:
+                requests.extend(
+                    self.req_add_evidence_to_fact(
+                        model_id,
+                        assign_var,
+                        member_var,
+                        has_substitutable_entity_predicate,
+                        evidence_type,
+                        [reference],
+                        None
+                    )
+                )
+
+        return self.m3_batch(requests)
 
     def get_model(self, model_id: str) -> BaristaResponse:
+        """Get a model by ID.
+
+        Note: Uses simple batch execution to avoid recursion with _snapshot_model.
+        """
         req = self.req_get_model(model_id)
-        return self.m3_batch([req])
+        return self._execute_simple_batch([req], privileged=True)
 
     def export_model(self, model_id: str, format: str = "owl") -> BaristaResponse:
         """Export a model in the specified format.
@@ -1293,7 +1639,8 @@ class BaristaClient:
         if not resp.ok:
             return resp
 
-        data = resp.raw.get("data", {})
+        # Use Pydantic model for type-safe access
+        model_data = resp.data
 
         # Build markdown document
         lines = []
@@ -1304,15 +1651,13 @@ class BaristaClient:
         comments = []
 
         # Extract model annotations
-        for ann in data.get("annotations", []):
-            key = ann.get("key", "")
-            value = ann.get("value", "")
-            if key == "title":
-                title = value
-            elif key == "state":
-                state = value
-            elif key == "comment":
-                comments.append(value)
+        for ann in model_data.annotations:
+            if ann.key == "title":
+                title = ann.value
+            elif ann.key == "state":
+                state = ann.value
+            elif ann.key == "comment":
+                comments.append(ann.value)
 
         lines.append(f"# {title}")
         lines.append("")
@@ -1328,37 +1673,32 @@ class BaristaClient:
         lines.append("")
 
         # Individuals/Activities
-        individuals = data.get("individuals", [])
+        individuals = model_data.individuals
         if individuals:
             lines.append("## Activities and Entities")
             lines.append("")
 
             # Group individuals by their primary type
             for ind in individuals:
-                ind_id = ind.get("id", "unknown")
-
                 # Get the main type
-                types = ind.get("type", [])
-                if types:
-                    main_type = types[0]
-                    type_id = main_type.get("id", "unknown")
-                    type_label = main_type.get("label", type_id)
+                if ind.type:
+                    main_type = ind.type[0]
+                    type_id = main_type.id
+                    type_label = main_type.label or type_id
                 else:
                     type_id = "unknown"
                     type_label = "Unknown type"
 
                 # Get annotations
                 annotations: Dict[str, List[str]] = {}
-                for ann in ind.get("annotations", []):
-                    key = ann.get("key", "")
-                    value = ann.get("value", "")
-                    if key not in annotations:
-                        annotations[key] = []
-                    annotations[key].append(value)
+                for ann in ind.annotations:
+                    if ann.key not in annotations:
+                        annotations[ann.key] = []
+                    annotations[ann.key].append(ann.value)
 
                 # Format individual
                 lines.append(f"### {type_label}")
-                lines.append(f"- **ID**: `{ind_id}`")
+                lines.append(f"- **ID**: `{ind.id}`")
                 lines.append(f"- **Type**: [{type_label}]({type_id})")
 
                 # Show enabled_by if present
@@ -1381,7 +1721,7 @@ class BaristaClient:
                 lines.append("")
 
         # Facts/Relationships
-        facts = data.get("facts", [])
+        facts = model_data.facts
         if facts:
             lines.append("## Relationships")
             lines.append("")
@@ -1389,32 +1729,26 @@ class BaristaClient:
             # Group facts by predicate type
             fact_groups: Dict[str, List[Dict[str, Any]]] = {}
             for fact in facts:
-                subject = fact.get("subject", "")
-                object = fact.get("object", "")
-                predicate = fact.get("predicate", {})
-                pred_id = predicate.get("id", "unknown")
-                pred_label = predicate.get("label", pred_id)
+                pred_label = fact.property_label or fact.property
 
                 if pred_label not in fact_groups:
                     fact_groups[pred_label] = []
 
                 # Find subject and object labels
-                subj_label = self._find_individual_label(individuals, subject)
-                obj_label = self._find_individual_label(individuals, object)
+                subj_label = self._find_individual_label(individuals, fact.subject)
+                obj_label = self._find_individual_label(individuals, fact.object)
 
                 # Get evidence annotations
                 evidence = []
-                for ann in fact.get("annotations", []):
-                    key = ann.get("key", "")
-                    value = ann.get("value", "")
-                    if key == "evidence":
-                        evidence.append(value)
+                for ann in fact.annotations:
+                    if ann.key == "evidence":
+                        evidence.append(ann.value)
 
                 fact_groups[pred_label].append({
                     "subject": subj_label,
                     "object": obj_label,
-                    "subject_id": subject,
-                    "object_id": object,
+                    "subject_id": fact.subject,
+                    "object_id": fact.object,
                     "evidence": evidence
                 })
 
@@ -1443,27 +1777,26 @@ class BaristaClient:
 
         return export_response
 
-    def _find_individual_label(self, individuals: List[Dict], ind_id: str) -> str:
+    def _find_individual_label(self, individuals: List[Individual], ind_id: str) -> str:
         """Find a readable label for an individual.
 
         Args:
-            individuals: List of individuals from the model
+            individuals: List of Individual objects from the model
             ind_id: The individual ID to look up
 
         Returns:
             A readable label for the individual
         """
         for ind in individuals:
-            if ind.get("id") == ind_id:
+            if ind.id == ind_id:
                 # Try to get rdfs:label first
-                for ann in ind.get("annotations", []):
-                    if ann.get("key") == "rdfs:label":
-                        return ann.get("value", ind_id)
+                for ann in ind.annotations:
+                    if ann.key == "rdfs:label":
+                        return ann.value
 
                 # Otherwise use the type label
-                types = ind.get("type", [])
-                if types:
-                    return types[0].get("label", ind_id)
+                if ind.type:
+                    return ind.type[0].label or ind_id
 
         return ind_id
 
@@ -1647,112 +1980,28 @@ class BaristaClient:
         req = self.req_remove_model_annotation(model_id, key, value)
         return self.m3_batch([req])
 
-    def execute_with_validation(
-        self,
-        requests: List[Dict[str, Any]],
-        expected_individuals: Optional[List[Dict[str, str]]] = None,
-        expected_facts: Optional[List[Dict[str, str]]] = None,
-        privileged: bool = True,
-        track_variables: Optional[bool] = None
-    ) -> BaristaResponse:
-        """Execute requests with validation and automatic rollback on failure.
-
-        This method executes a batch of requests with undo enabled, then validates
-        the result against expected conditions. If validation fails, it automatically
-        rolls back the changes. Variables are only tracked if validation succeeds.
-
-        Args:
-            requests: List of request dictionaries to execute
-            expected_individuals: List of expected individual types after execution
-                                e.g., [{"id": "GO:0004672", "label": "protein kinase activity"}]
-            expected_facts: List of expected facts (not yet implemented)
-            privileged: Whether to use the privileged endpoint
-            track_variables: Whether to track variables (defaults to self.track_variables)
-
-        Returns:
-            BaristaResponse - either the successful response or the rollback response
-            Check response.validation_failed to determine if rollback occurred
-
-        Example:
-            >>> # req = client.req_add_individual(model_id, "GO:0003924")
-            >>> # response = client.execute_with_validation(
-            >>> #     [req],
-            >>> #     expected_individuals=[{"id": "GO:0003924"}]
-            >>> # )
-            >>> # if response.validation_failed:
-            >>> #     print(f"Rolled back: {response.validation_reason}")
-            ... # doctest: +SKIP
-        """
-        # Determine if we should track variables
-        should_track = track_variables if track_variables is not None else self.track_variables
-
-        # Take snapshot for variable tracking if needed
-        before_state = None
-        if should_track:
-            # Extract model_id from first request with model-id
-            model_id = None
-            for req in requests:
-                model_id = req.get("arguments", {}).get("model-id")
-                if model_id:
-                    before_state = self._snapshot_model(model_id)
-                    break
-
-        # Always enable undo for validation
-        response = self.m3_batch(requests, privileged=privileged, enable_undo=True)
-
-        if not response.ok:
-            return response  # Operation failed, no validation needed
-
-        # Perform validation checks
-        if expected_individuals:
-            response = response.validate_and_rollback(
-                expected_individuals,
-                validation_type="individuals"
-            )
-
-        if expected_facts and not response.validation_failed:
-            # TODO: Implement fact validation
-            pass
-
-        # Only track variables if validation succeeded (or wasn't used)
-        if should_track and not response.validation_failed and before_state:
-            self._handle_variable_tracking_for_requests(requests, response, before_state)
-
-        return response
-
-    def add_individual_validated(
+    def remove_individual_annotation(
         self,
         model_id: str,
-        class_curie: str,
-        expected_type: Optional[Dict[str, str]] = None,
-        assign_var: str = "x1"
+        individual_id: str,
+        key: str,
+        value: str,
     ) -> BaristaResponse:
-        """Add an individual with validation that it was created with the expected type.
-
-        Variable tracking only occurs if validation succeeds. If validation fails and
-        the operation is rolled back, no variable mapping is created.
+        """Remove an annotation from an individual.
 
         Args:
             model_id: The model ID
-            class_curie: The class/type for the individual
-            expected_type: Expected type dict with 'id' and/or 'label'
-                         If not provided, validates against class_curie
-            assign_var: Variable name to assign (only if validation succeeds)
+            individual_id: The individual ID
+            key: The annotation key to remove
+            value: The value to remove
 
         Returns:
-            BaristaResponse - rolls back automatically if validation fails
+            BaristaResponse
         """
-        if expected_type is None:
-            expected_type = {"id": class_curie}
-
-        req = self.req_add_individual(model_id, class_curie, assign_var)
-        response = self.execute_with_validation(
-            [req],
-            expected_individuals=[expected_type],
-            track_variables=True  # Explicitly enable tracking (only happens on success)
+        req = self.req_remove_individual_annotation(
+            model_id, individual_id, key, value
         )
-
-        return response
+        return self.m3_batch([req])
 
     def update_individual_annotation(
         self,
@@ -1761,80 +2010,25 @@ class BaristaClient:
         key: str,
         value: str,
         old_value: Optional[str] = None,
-        validation: Optional[Dict[str, str]] = None,
     ) -> BaristaResponse:
-        """Update an annotation on an individual with optional validation.
-
-        Args:
-            model_id: The model ID
-            individual_id: The individual to annotate
-            key: The annotation key (e.g., 'rdfs:label', 'enabled_by')
-            value: The new value for the annotation
-            old_value: The current value (for replacement)
-            validation: Optional validation dict with 'id' and/or 'label'
-                       to verify the individual before updating
-
-        Returns:
-            BaristaResponse - rolls back automatically if validation fails
-
-        Example:
-            >>> # Update contributor with validation
-            >>> # response = client.update_individual_annotation(
-            >>> #     model_id,
-            >>> #     individual_id,
-            >>> #     "contributor",
-            >>> #     "https://orcid.org/0000-0002-6601-2165",
-            >>> #     validation={"id": individual_id, "label": "GTPase activity"}
-            >>> # )
-            >>> # if response.validation_failed:
-            >>> #     print(f"Wrong individual! Expected label 'GTPase activity'")
-            ... # doctest: +SKIP
-        """
-        req_result = self.req_update_individual_annotation(
-            model_id, individual_id, key, value, old_value
-        )
-
-        # req_result can be either a single request or a list of requests
-        requests = req_result if isinstance(req_result, list) else [req_result]
-
-        if validation:
-            return self.execute_with_validation(
-                requests,
-                expected_individuals=[validation]
-            )
-        else:
-            return self.m3_batch(requests)
-
-    def remove_individual_annotation(
-        self,
-        model_id: str,
-        individual_id: str,
-        key: str,
-        value: str,
-        validation: Optional[Dict[str, str]] = None,
-    ) -> BaristaResponse:
-        """Remove an annotation from an individual with optional validation.
+        """Update an annotation on an individual.
 
         Args:
             model_id: The model ID
             individual_id: The individual ID
-            key: The annotation key to remove
-            value: The value to remove
-            validation: Optional validation dict with 'id' and/or 'label'
-                       to verify the individual before removing
+            key: The annotation key
+            value: The new value for the annotation
+            old_value: The current value (optional, for replacement)
 
         Returns:
-            BaristaResponse - rolls back automatically if validation fails
+            BaristaResponse
         """
-        req = self.req_remove_individual_annotation(
-            model_id, individual_id, key, value
+        req = self.req_update_individual_annotation(
+            model_id, individual_id, key, value, old_value
         )
-
-        if validation:
-            return self.execute_with_validation(
-                [req],
-                expected_individuals=[validation]
-            )
+        # req could be a single request or a list
+        if isinstance(req, list):
+            return self.m3_batch(req)
         else:
             return self.m3_batch([req])
 
@@ -1864,21 +2058,16 @@ class BaristaClient:
                 "If you really need to clear a production model, use force=True (dangerous!)"
             )
 
-        requests = []
+        requests: List[MinervaRequest] = []
 
         # Remove all facts/edges first (before removing individuals)
         for fact in model_resp.facts:
-            subject = fact.get("subject")
-            object_ = fact.get("object")
-            predicate = fact.get("property")
-            if subject and object_ and predicate:
-                requests.append(self.req_remove_fact(model_id, subject, object_, predicate))
+            if fact.subject and fact.object and fact.property:
+                requests.append(self.req_remove_fact(model_id, fact.subject, fact.object, fact.property))
 
         # Remove all individuals
         for individual in model_resp.individuals:
-            individual_id = individual.get("id")
-            if individual_id:
-                requests.append(self.req_remove_individual(model_id, individual_id))
+            requests.append(self.req_remove_individual(model_id, individual.id))
 
         if not requests:
             # Model is already empty
@@ -1957,15 +2146,14 @@ class BaristaClient:
             # Look for MF annotations on the bioentity
 
             # Get bioentity ID from object annotations
-            for ann in object_.get("annotations", []):
-                if ann.get("key") == "id":
-                    bioentity_id = ann.get("value")
+            for ann in object_.annotations:
+                if ann.key == "id":
+                    bioentity_id = ann.value
                     break
 
             # Get GO term from subject type
-            subject_type = subject.get("type", {})
-            if subject_type:
-                go_term = subject_type.get("id")
+            if subject.type:
+                go_term = subject.type[0].id
                 aspect = "F"  # Molecular Function
 
         # Check for activity->process relationship (RO:0002211, RO:0002212, RO:0002213, RO:0002578, etc.)
@@ -1979,9 +2167,11 @@ class BaristaClient:
             "RO:0002233", "http://purl.obolibrary.org/obo/RO_0002233",  # has input
         ]:
             # Determine if object is a process or location
-            object_type = object_.get("type", {})
-            object_type_id = object_type.get("id", "")
-            object_label = object_type.get("label", "").lower()
+            object_type_id = ""
+            object_label = ""
+            if object_.type:
+                object_type_id = object_.type[0].id
+                object_label = (object_.type[0].label or "").lower()
 
             # Better heuristic: check the label for process vs location keywords
             # Process terms often contain: process, regulation, pathway, signaling, metabolism, etc.
@@ -2004,9 +2194,9 @@ class BaristaClient:
                 aspect = "P"  # Biological Process
 
             # Get the bioentity that enables the subject activity
-            for ann in subject.get("annotations", []):
-                if ann.get("key") == "enabled_by":
-                    bioentity_id = ann.get("value")
+            for ann in subject.annotations:
+                if ann.key == "enabled_by":
+                    bioentity_id = ann.value
                     break
 
             # Get GO term from object type
@@ -2018,14 +2208,14 @@ class BaristaClient:
             aspect = "C"  # Cellular Component
 
             # Get the bioentity that enables the subject activity
-            for ann in subject.get("annotations", []):
-                if ann.get("key") == "enabled_by":
-                    bioentity_id = ann.get("value")
+            for ann in subject.annotations:
+                if ann.key == "enabled_by":
+                    bioentity_id = ann.value
                     break
 
             # Get GO term from object type
-            object_type = object_.get("type", {})
-            go_term = object_type.get("id")
+            if object_.type:
+                go_term = object_.type[0].id
 
         # If we have enough information, search for annotations
         if bioentity_id and go_term:
@@ -2068,10 +2258,10 @@ class BaristaClient:
 
         return {
             "edge": {
-                "subject": subject.get("id"),
-                "subject_label": subject.get("type", {}).get("label"),
-                "object": object_.get("id"),
-                "object_label": object_.get("type", {}).get("label"),
+                "subject": subject.id,
+                "subject_label": subject.type[0].label if subject.type else None,
+                "object": object_.id,
+                "object_label": object_.type[0].label if object_.type else None,
                 "predicate": predicate
             },
             "mapping_type": mapping_type,
@@ -2118,16 +2308,12 @@ class BaristaClient:
 
         # Process each fact/edge in the model
         for fact in model_resp.facts:
-            subject = fact.get("subject")
-            object_ = fact.get("object")
-            predicate = fact.get("property")
-
-            if subject and object_ and predicate:
+            if fact.subject and fact.object and fact.property:
                 edge_evidence = self.find_evidence_for_edge(
                     model_id,
-                    subject,
-                    object_,
-                    predicate,
+                    fact.subject,
+                    fact.object,
+                    fact.property,
                     amigo_base_url=amigo_base_url,
                     evidence_types=evidence_types,
                     limit=limit_per_edge
@@ -2156,7 +2342,7 @@ class BaristaClient:
             "summary": summary
         }
 
-    def _resolve_individual(self, model_resp: BaristaResponse, individual_id: str) -> Optional[Dict[str, Any]]:
+    def _resolve_individual(self, model_resp: BaristaResponse, individual_id: str) -> Optional[Individual]:
         """Resolve an individual ID (which might be a variable name) to the actual individual.
 
         Args:
@@ -2164,18 +2350,18 @@ class BaristaClient:
             individual_id: The individual ID or variable name
 
         Returns:
-            The individual dict, or None if not found
+            The Individual object, or None if not found
         """
         # First try direct ID match
         for individual in model_resp.individuals:
-            if individual.get("id") == individual_id:
+            if individual.id == individual_id:
                 return individual
 
         # Then try variable name match
         if hasattr(self, '_variables') and individual_id in self._variables:
             resolved_id = self._variables[individual_id]
             for individual in model_resp.individuals:
-                if individual.get("id") == resolved_id:
+                if individual.id == resolved_id:
                     return individual
 
         return None
