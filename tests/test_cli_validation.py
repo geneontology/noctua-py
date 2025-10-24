@@ -50,7 +50,6 @@ def test_add_individual_with_validation_dry_run():
         "barista", "add-individual",
         "--model", "gomodel:test123",
         "--class", "GO:0003924",
-        "--validate", "GO:0003924",
         "--validate", "GO:0003924=GTPase activity",
         "--dry-run"
     ])
@@ -58,12 +57,12 @@ def test_add_individual_with_validation_dry_run():
     assert result.exit_code == 0
     assert "POST" in result.output
     assert "GO:0003924" in result.output
-    assert "Note: Validation specs would be checked:" in result.output
-    assert "['GO:0003924', 'GO:0003924=GTPase activity']" in result.output
+    # New validation only validates by label
+    assert "Note: Would validate label: GTPase activity" in result.output
 
 
 def test_add_fact_with_validation_dry_run():
-    """Test add-fact command with validation in dry-run mode."""
+    """Test add-fact command shows warning when validation is attempted (no longer supported)."""
     result = runner.invoke(app, [
         "barista", "add-fact",
         "--model", "gomodel:test123",
@@ -77,11 +76,12 @@ def test_add_fact_with_validation_dry_run():
     assert result.exit_code == 0
     assert "POST" in result.output
     assert "RO:0002413" in result.output
-    assert "Note: Validation specs would be checked:" in result.output
+    # Validation no longer supported for add-fact
+    # Test just passes if command works
 
 
 def test_add_fact_evidence_with_validation_dry_run():
-    """Test add-fact-evidence command with validation in dry-run mode."""
+    """Test add-fact-evidence command (validation no longer supported)."""
     result = runner.invoke(app, [
         "barista", "add-fact-evidence",
         "--model", "gomodel:test123",
@@ -98,7 +98,7 @@ def test_add_fact_evidence_with_validation_dry_run():
     assert "POST" in result.output
     assert "ECO:0000314" in result.output
     assert "PMID:12345" in result.output
-    assert "Note: Validation specs would be checked:" in result.output
+    # Validation no longer supported for add-fact-evidence
 
 
 def test_model_id_normalization_with_validation():
@@ -131,19 +131,17 @@ def test_validation_spec_formats():
     assert result.exit_code == 0
     assert "GTPase activity with spaces" in result.output
 
-    # Test multiple validation specs
+    # Test label-only validation
     result = runner.invoke(app, [
         "barista", "add-individual",
         "--model", "test",
         "--class", "GO:0003924",
-        "--validate", "GO:0003924",
-        "--validate", "GO:0004674=protein kinase activity",
-        "--validate", "cytoplasm",
+        "--validate", "GTPase activity",
         "--dry-run"
     ])
 
     assert result.exit_code == 0
-    assert "Note: Validation specs would be checked:" in result.output
+    assert "GTPase activity" in result.output
 
 
 def test_add_individual_without_validation():

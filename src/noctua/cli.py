@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import typer
 import yaml
@@ -43,9 +43,11 @@ from .barista import (
     BaristaClient,
     BaristaError,
 )
+from .models import ProteinComplexComponent, EntitySetMember
 from .session import SessionManager
 
 if TYPE_CHECKING:
+    from .models import MinervaRequest
     from .amigo import AmigoClient
 
 # Top-level Typer app
@@ -139,11 +141,14 @@ def _resolve_session_variables(
     return session_manager, resolved
 
 
-def _print_dry_run(url: str, requests: List[dict], intention: str = "action", provided_by: Optional[str] = None) -> None:
+def _print_dry_run(url: str, requests: Sequence["MinervaRequest"], intention: str = "action", provided_by: Optional[str] = None) -> None:
+    # Convert Pydantic models to dicts for display
+    normalized_requests = [req.model_dump(by_alias=True, exclude_none=True) for req in requests]
+
     payload = {
         "intention": intention,
         "provided-by": provided_by or os.environ.get("BARISTA_PROVIDED_BY", "http://geneontology.org"),
-        "requests": requests,
+        "requests": normalized_requests,
     }
     typer.echo(f"POST {url}")
     typer.echo(json.dumps(payload, indent=2))
@@ -181,12 +186,12 @@ def _parse_validation_spec(validation_specs: Optional[List[str]]) -> Optional[Li
 
 @barista_app.command("create-model")
 def create_model(
-    title: Optional[str] = typer.Option(None, "--title", help="Title for the new model"),
+    title: Optional[str] = typer.Option(None, "--title", "-T", help="Title for the new model"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL (overrides --live flag)"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace (overrides --live flag)"),
     provided_by: Optional[str] = typer.Option(None, help="provided-by agent"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    live: bool = typer.Option(False, "--live", "-L", help="Use production server instead of dev server"),
 ):
     """Create a new empty GO-CAM model."""
     client = _make_client(token, base_url, namespace, provided_by, live)
@@ -205,17 +210,17 @@ def create_model(
 
 @barista_app.command("add-individual")
 def add_individual(
-    model: str = typer.Option(..., "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
-    class_curie: str = typer.Option(..., "--class", help="Class CURIE to instantiate (e.g., GO:0016055)"),
-    assign: str = typer.Option("x1", "--assign", help="Assign-to-variable identifier"),
-    validate: Optional[List[str]] = typer.Option(None, "--validate", help="Expected types (e.g., 'GO:0003924' or 'GO:0003924=GTPase activity')"),
-    session: Optional[str] = typer.Option(None, "--session", help="Session name for persistent variable tracking"),
+    model: str = typer.Option(..., "-m", "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
+    class_curie: str = typer.Option(..., "-c", "--class", help="Class CURIE to instantiate (e.g., GO:0016055)"),
+    assign: str = typer.Option("x1", "-a", "--assign", help="Assign-to-variable identifier"),
+    validate: Optional[List[str]] = typer.Option(None, "-V", "--validate", help="Expected types (e.g., 'GO:0003924' or 'GO:0003924=GTPase activity')"),
+    session: Optional[str] = typer.Option(None, "-S", "--session", help="Session name for persistent variable tracking"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL (overrides --live flag)"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace (overrides --live flag)"),
     provided_by: Optional[str] = typer.Option(None, help="provided-by agent"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print the request and do not POST"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    dry_run: bool = typer.Option(False, "-n", "--dry-run", help="Print the request and do not POST"),
+    live: bool = typer.Option(False, "-L", "--live", help="Use production server instead of dev server"),
 ):
     """Add an individual of CLASS to MODEL via Barista m3BatchPrivileged.
 
@@ -239,7 +244,14 @@ def add_individual(
     if session:
         typer.echo(f"📂 Using session: {session}")
 
-    req = BaristaClient.req_add_individual(model, class_curie, assign)
+    # Parse validation specs if provided - extract label for validation
+    expected_label = None
+    if validate:
+        expected_individuals = _parse_validation_spec(validate)
+        if expected_individuals and expected_individuals[0].get("label"):
+            expected_label = expected_individuals[0]["label"]
+
+    req = BaristaClient.req_add_individual(model, class_curie, assign, expected_label)
     if dry_run:
         # Determine URL for dry run display
         if base_url:
@@ -258,8 +270,8 @@ def add_individual(
 
         url = f"{actual_base.rstrip('/')}/api/{actual_namespace}/m3BatchPrivileged"
         _print_dry_run(url, [req], provided_by=provided_by or DEFAULT_PROVIDED_BY)
-        if validate:
-            typer.echo(f"Note: Validation specs would be checked: {validate}")
+        if expected_label:
+            typer.echo(f"Note: Would validate label: {expected_label}")
         raise typer.Exit(code=0)
 
     client = _make_client(token, base_url, namespace, provided_by, live)
@@ -269,24 +281,18 @@ def add_individual(
         # Load existing variables from session into client
         session_manager.copy_variables_to_client(session, model, client)
 
-    # Parse validation specs if provided
-    expected_individuals = _parse_validation_spec(validate)
-
     # Take snapshot for variable tracking
     before_state = client._snapshot_model(model) if assign else None
 
-    if expected_individuals:
-        # Use validation-enabled execution
-        resp = client.execute_with_validation([req], expected_individuals=expected_individuals)
-        if resp.validation_failed:
-            typer.echo(f"❌ Validation failed and rolled back: {resp.validation_reason}", err=True)
-            typer.echo(json.dumps(resp.raw, indent=2))
-            raise typer.Exit(code=1)
-        else:
-            typer.echo("✓ Operation succeeded and passed validation")
-    else:
-        # Standard execution without validation
-        resp = client.m3_batch([req])
+    # Execute with automatic validation (if expected_label was set in req)
+    resp = client.m3_batch([req])
+
+    if resp.validation_failed:
+        typer.echo(f"❌ Validation failed and rolled back: {resp.validation_reason}", err=True)
+        typer.echo(json.dumps(resp.raw, indent=2))
+        raise typer.Exit(code=1)
+    elif expected_label:
+        typer.echo("✓ Operation succeeded and passed validation")
 
     # Handle variable tracking
     if resp.ok and assign and before_state:
@@ -311,18 +317,18 @@ def add_individual(
 
 @barista_app.command("add-fact")
 def add_fact(
-    model: str = typer.Option(..., "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
-    subject: str = typer.Option(..., "--subject", help="Subject individual id (CURIE/IRI in model) or variable name"),
-    object_: str = typer.Option(..., "--object", help="Object individual id (CURIE/IRI in model) or variable name"),
-    predicate: str = typer.Option(..., "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
-    validate: Optional[List[str]] = typer.Option(None, "--validate", help="Expected types after operation"),
-    session: Optional[str] = typer.Option(None, "--session", help="Session name for loading variables"),
+    model: str = typer.Option(..., "-m", "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
+    subject: str = typer.Option(..., "-s", "--subject", help="Subject individual id (CURIE/IRI in model) or variable name"),
+    object_: str = typer.Option(..., "-t", "--object", help="Target/object individual id (CURIE/IRI in model) or variable name"),
+    predicate: str = typer.Option(..., "-p", "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
+    validate: Optional[List[str]] = typer.Option(None, "-V", "--validate", help="Expected types after operation"),
+    session: Optional[str] = typer.Option(None, "-S", "--session", help="Session name for loading variables"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV),
     base_url: Optional[str] = typer.Option(None),
     namespace: Optional[str] = typer.Option(None),
     provided_by: Optional[str] = typer.Option(None),
-    dry_run: bool = typer.Option(False, "--dry-run"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    dry_run: bool = typer.Option(False, "-n", "--dry-run"),
+    live: bool = typer.Option(False, "-L", "--live", help="Use production server instead of dev server"),
 ):
     """Add an edge (fact) between two individuals in MODEL.
 
@@ -347,27 +353,15 @@ def add_fact(
         actual_namespace = namespace or (LIVE_NAMESPACE if live else DEFAULT_NAMESPACE)
         url = f"{actual_base.rstrip('/')}/api/{actual_namespace}/m3BatchPrivileged"
         _print_dry_run(url, [req], provided_by=provided_by or DEFAULT_PROVIDED_BY)
-        if validate:
-            typer.echo(f"Note: Validation specs would be checked: {validate}")
         raise typer.Exit(code=0)
 
     client = _make_client(token, base_url, namespace, provided_by, live)
 
-    # Parse validation specs if provided
-    expected_individuals = _parse_validation_spec(validate)
+    # Note: Validation was removed in refactor - only AddIndividual supports validation via expected_label
+    if validate:
+        typer.echo("⚠️  Warning: Validation is no longer supported for add-fact (only add-individual supports it)", err=True)
 
-    if expected_individuals:
-        # Use validation-enabled execution
-        resp = client.execute_with_validation([req], expected_individuals=expected_individuals)
-        if resp.validation_failed:
-            typer.echo(f"❌ Validation failed and rolled back: {resp.validation_reason}", err=True)
-            typer.echo(json.dumps(resp.raw, indent=2))
-            raise typer.Exit(code=1)
-        else:
-            typer.echo("✓ Operation succeeded and passed validation")
-    else:
-        # Standard execution without validation
-        resp = client.m3_batch([req])
+    resp = client.m3_batch([req])
 
     typer.echo(json.dumps(resp.raw, indent=2))
     if not resp.ok:
@@ -376,21 +370,21 @@ def add_fact(
 
 @barista_app.command("add-fact-evidence")
 def add_fact_evidence(
-    model: str = typer.Option(..., "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
-    subject: str = typer.Option(..., "--subject", help="Subject individual id or variable name"),
-    object_: str = typer.Option(..., "--object", help="Object individual id or variable name"),
-    predicate: str = typer.Option(..., "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
-    eco: str = typer.Option(..., "--eco", help="ECO evidence code (e.g., ECO:0000353)"),
-    source: List[str] = typer.Option(..., "--source", help="One or more source CURIEs, e.g., PMID:...", rich_help_panel="Evidence"),
-    with_from: List[str] = typer.Option(None, "--with", help="Optional with/from CURIEs", rich_help_panel="Evidence"),
-    validate: Optional[List[str]] = typer.Option(None, "--validate", help="Expected types after operation"),
-    session: Optional[str] = typer.Option(None, "--session", help="Session name for loading variables"),
+    model: str = typer.Option(..., "-m", "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
+    subject: str = typer.Option(..., "-s", "--subject", help="Subject individual id or variable name"),
+    object_: str = typer.Option(..., "-t", "--object", help="Target/object individual id or variable name"),
+    predicate: str = typer.Option(..., "-p", "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
+    eco: str = typer.Option(..., "-e", "--eco", help="ECO evidence code (e.g., ECO:0000353)"),
+    source: List[str] = typer.Option(..., "-r", "--source", help="One or more source CURIEs, e.g., PMID:...", rich_help_panel="Evidence"),
+    with_from: List[str] = typer.Option(None, "-w", "--with", help="Optional with/from CURIEs", rich_help_panel="Evidence"),
+    validate: Optional[List[str]] = typer.Option(None, "-V", "--validate", help="Expected types after operation"),
+    session: Optional[str] = typer.Option(None, "-S", "--session", help="Session name for loading variables"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV),
     base_url: Optional[str] = typer.Option(None),
     namespace: Optional[str] = typer.Option(None),
     provided_by: Optional[str] = typer.Option(None),
-    dry_run: bool = typer.Option(False, "--dry-run"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    dry_run: bool = typer.Option(False, "-n", "--dry-run"),
+    live: bool = typer.Option(False, "-L", "--live", help="Use production server instead of dev server"),
 ):
     """Add evidence annotation to an edge in MODEL (creates evidence individual and binds).
 
@@ -415,27 +409,15 @@ def add_fact_evidence(
         actual_namespace = namespace or (LIVE_NAMESPACE if live else DEFAULT_NAMESPACE)
         url = f"{actual_base.rstrip('/')}/api/{actual_namespace}/m3BatchPrivileged"
         _print_dry_run(url, reqs, provided_by=provided_by or DEFAULT_PROVIDED_BY)
-        if validate:
-            typer.echo(f"Note: Validation specs would be checked: {validate}")
         raise typer.Exit(code=0)
 
     client = _make_client(token, base_url, namespace, provided_by, live)
 
-    # Parse validation specs if provided
-    expected_individuals = _parse_validation_spec(validate)
+    # Note: Validation was removed in refactor - only AddIndividual supports validation via expected_label
+    if validate:
+        typer.echo("⚠️  Warning: Validation is no longer supported for add-fact-evidence (only add-individual supports it)", err=True)
 
-    if expected_individuals:
-        # Use validation-enabled execution
-        resp = client.execute_with_validation(reqs, expected_individuals=expected_individuals)
-        if resp.validation_failed:
-            typer.echo(f"❌ Validation failed and rolled back: {resp.validation_reason}", err=True)
-            typer.echo(json.dumps(resp.raw, indent=2))
-            raise typer.Exit(code=1)
-        else:
-            typer.echo("✓ Operation succeeded and passed validation")
-    else:
-        # Standard execution without validation
-        resp = client.m3_batch(reqs)
+    resp = client.m3_batch(reqs)
 
     typer.echo(json.dumps(resp.raw, indent=2))
     if not resp.ok:
@@ -477,17 +459,17 @@ def delete_individual(
 
 @barista_app.command("delete-edge")
 def delete_edge(
-    model: str = typer.Option(..., "--model", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
-    subject: str = typer.Option(..., "--subject", help="Subject individual id or variable name"),
-    object_: str = typer.Option(..., "--object", help="Object individual id or variable name"),
-    predicate: str = typer.Option(..., "--predicate", help="Predicate CURIE (e.g., RO:0002333)"),
-    session: Optional[str] = typer.Option(None, "--session", help="Session name for loading variables"),
+    model: str = typer.Option(..., "--model", "-m", help="Target model id (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
+    subject: str = typer.Option(..., "--subject", "-s", help="Subject individual id or variable name"),
+    object_: str = typer.Option(..., "--object", "-t", help="Object individual id or variable name"),
+    predicate: str = typer.Option(..., "--predicate", "-p", help="Predicate CURIE (e.g., RO:0002333)"),
+    session: Optional[str] = typer.Option(None, "--session", "-S", help="Session name for loading variables"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace"),
     provided_by: Optional[str] = typer.Option(None, help="provided-by agent"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print the request without executing"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print the request without executing"),
+    live: bool = typer.Option(False, "--live", "-L", help="Use production server instead of dev server"),
 ):
     """Delete an edge (fact) between two individuals in a model.
 
@@ -526,15 +508,15 @@ def delete_edge(
 
 @barista_app.command("clear-model")
 def clear_model(
-    model: str = typer.Option(..., "--model", help="Target model id to clear (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
+    model: str = typer.Option(..., "--model", "-m", help="Target model id to clear (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace"),
     provided_by: Optional[str] = typer.Option(None, help="provided-by agent"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print what would be removed without actually removing"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print what would be removed without actually removing"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
-    force: bool = typer.Option(False, "--force", help="Force clear even if model is in production state (DANGEROUS)"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    force: bool = typer.Option(False, "--force", "-F", help="Force clear even if model is in production state (DANGEROUS)"),
+    live: bool = typer.Option(False, "--live", "-L", help="Use production server instead of dev server"),
 ):
     """Remove all nodes and edges from a model, leaving it empty.
 
@@ -584,9 +566,9 @@ def clear_model(
     if dry_run:
         typer.echo("\n[DRY RUN] Would remove:")
         for individual in model_resp.individuals:
-            typer.echo(f"  - Individual: {individual.get('id')}")
+            typer.echo(f"  - Individual: {individual.id}")
         for fact in model_resp.facts:
-            typer.echo(f"  - Fact: {fact.get('subject')} -> {fact.get('object')} [{fact.get('property')}]")
+            typer.echo(f"  - Fact: {fact.subject} -> {fact.object} [{fact.property}]")
         raise typer.Exit(code=0)
 
     # Confirm before clearing
@@ -621,14 +603,14 @@ def clear_model(
 
 @barista_app.command("export-model")
 def export_model(
-    model: str = typer.Option(..., "--model", help="Target model id to export (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
+    model: str = typer.Option(..., "--model", "-m", help="Target model id to export (e.g., gomodel:6796b94c00003233 or just 6796b94c00003233)"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output file (default: stdout)"),
     format: str = typer.Option("minerva-json", "--format", "-f", help="Export format: minerva-json (native), gocam-json, gocam-yaml, markdown"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace"),
     provided_by: Optional[str] = typer.Option(None, help="provided-by agent"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    live: bool = typer.Option(False, "--live", "-L", help="Use production server instead of dev server"),
 ):
     """Export a model in various formats (minerva-json, gocam-json, gocam-yaml, markdown)."""
     model = _normalize_model_id(model)
@@ -904,18 +886,18 @@ def remove_annotation(
 
 @barista_app.command("update-individual-annotation")
 def update_individual_annotation(
-    model: str = typer.Option(..., "--model", help="Target model id"),
-    individual: str = typer.Option(..., "--individual", help="Individual ID to update"),
-    key: str = typer.Option(..., "--key", help="Annotation key (e.g., 'enabled_by', 'rdfs:label')"),
-    value: str = typer.Option(..., "--value", help="New value for the annotation"),
+    model: str = typer.Option(..., "--model", "-m", help="Target model id"),
+    individual: str = typer.Option(..., "--individual", "-i", help="Individual ID to update"),
+    key: str = typer.Option(..., "--key", "-k", help="Annotation key (e.g., 'enabled_by', 'rdfs:label')"),
+    value: str = typer.Option(..., "--value", "-v", help="New value for the annotation"),
     old_value: Optional[str] = typer.Option(None, "--old-value", help="Current value to replace (if not provided, adds new)"),
-    validate: Optional[str] = typer.Option(None, "--validate", help="Validation spec: 'id:label' to verify individual"),
+    validate: Optional[str] = typer.Option(None, "--validate", "-V", help="Validation spec: 'id:label' to verify individual"),
     token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV, help=f"Barista token (env {BARISTA_TOKEN_ENV})"),
     base_url: Optional[str] = typer.Option(None, help="Barista base URL"),
     namespace: Optional[str] = typer.Option(None, help="Minerva namespace"),
     provided_by: Optional[str] = typer.Option(None, help="provided-by agent"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without applying"),
-    live: bool = typer.Option(False, "--live", help="Use production server instead of dev server"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview changes without applying"),
+    live: bool = typer.Option(False, "--live", "-L", help="Use production server instead of dev server"),
 ):
     """Update an annotation on an individual within a model.
 
@@ -945,12 +927,9 @@ def update_individual_annotation(
 
     client = _make_client(token, base_url, namespace, provided_by, live)
 
-    # Parse validation spec if provided
-    validation_dict = None
+    # Note: Validation was removed in refactor
     if validate:
-        parsed = _parse_validation_spec([validate])
-        validation_dict = parsed[0] if parsed else None
-        typer.echo(f"Updating annotation with validation: {validation_dict}", err=True)
+        typer.echo("⚠️  Warning: Validation is no longer supported for update-individual-annotation", err=True)
 
     action = "Replacing" if old_value else "Adding"
     typer.echo(f"{action} annotation {key}={value} on individual {individual}...", err=True)
@@ -960,14 +939,10 @@ def update_individual_annotation(
         individual,
         key,
         value,
-        old_value=old_value,
-        validation=validation_dict
+        old_value=old_value
     )
 
-    if resp.validation_failed:
-        typer.echo(f"✗ Validation failed and changes rolled back: {resp.validation_reason}", err=True)
-        raise typer.Exit(code=1)
-    elif resp.ok:
+    if resp.ok:
         typer.echo("✓ Annotation updated successfully", err=True)
         typer.echo(json.dumps(resp.raw, indent=2))
     else:
@@ -1010,12 +985,9 @@ def remove_individual_annotation(
 
     client = _make_client(token, base_url, namespace, provided_by, live)
 
-    # Parse validation spec if provided
-    validation_dict = None
+    # Note: Validation was removed in refactor
     if validate:
-        parsed = _parse_validation_spec([validate])
-        validation_dict = parsed[0] if parsed else None
-        typer.echo(f"Removing annotation with validation: {validation_dict}", err=True)
+        typer.echo("⚠️  Warning: Validation is no longer supported for remove-individual-annotation", err=True)
 
     typer.echo(f"Removing annotation {key}={value} from individual {individual}...", err=True)
 
@@ -1023,14 +995,10 @@ def remove_individual_annotation(
         model,
         individual,
         key,
-        value,
-        validation=validation_dict
+        value
     )
 
-    if resp.validation_failed:
-        typer.echo(f"✗ Validation failed and changes rolled back: {resp.validation_reason}", err=True)
-        raise typer.Exit(code=1)
-    elif resp.ok:
+    if resp.ok:
         typer.echo("✓ Annotation removed successfully", err=True)
         typer.echo(json.dumps(resp.raw, indent=2))
     else:
@@ -1133,6 +1101,218 @@ def list_models(
                 line += f"\t({match_count} node matches)"
 
         typer.echo(line)
+
+
+def _parse_component_spec(spec: str) -> Dict[str, Optional[str]]:
+    """Parse a component/member specification string.
+
+    Format: entity_id|label=value|evidence=value|ref=value
+
+    Examples:
+        >>> _parse_component_spec("UniProtKB:P12345")
+        {'entity_id': 'UniProtKB:P12345', 'label': None, 'evidence_type': None, 'reference': None}
+
+        >>> _parse_component_spec("UniProtKB:P12345|label=Ras protein")
+        {'entity_id': 'UniProtKB:P12345', 'label': 'Ras protein', 'evidence_type': None, 'reference': None}
+
+        >>> _parse_component_spec("UniProtKB:P12345|label=Ras|evidence=ECO:0000314|ref=PMID:12345")
+        {'entity_id': 'UniProtKB:P12345', 'label': 'Ras', 'evidence_type': 'ECO:0000314', 'reference': 'PMID:12345'}
+    """
+    parts = spec.split("|")
+    entity_id = parts[0]
+
+    result: Dict[str, Optional[str]] = {
+        "entity_id": entity_id,
+        "label": None,
+        "evidence_type": None,
+        "reference": None
+    }
+
+    for part in parts[1:]:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key == "label":
+            result["label"] = value
+        elif key in ("evidence", "eco"):
+            result["evidence_type"] = value
+        elif key in ("ref", "reference"):
+            result["reference"] = value
+
+    return result
+
+
+@barista_app.command("add-protein-complex")
+def add_protein_complex(
+    model: str = typer.Option(..., "-m", "--model", help="Target model id (e.g., gomodel:6796b94c00003233)"),
+    component: List[str] = typer.Option(..., "-c", "--component", help="Component spec: entity_id|label=X|evidence=Y|ref=Z (can be repeated)"),
+    complex_class: str = typer.Option("GO:0032991", "--class", help="Complex class CURIE (default: GO:0032991 protein-containing complex)"),
+    assign_var: str = typer.Option("complex1", "--var", help="Variable name for the complex"),
+    expected_label: Optional[str] = typer.Option(None, "--expected-label", help="Expected label for validation"),
+    session: Optional[str] = typer.Option(None, "-S", "--session", help="Session name for saving variables"),
+    token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV),
+    base_url: Optional[str] = typer.Option(None),
+    namespace: Optional[str] = typer.Option(None),
+    provided_by: Optional[str] = typer.Option(None),
+    dry_run: bool = typer.Option(False, "-n", "--dry-run"),
+    live: bool = typer.Option(False, "-L", "--live", help="Use production server instead of dev server"),
+):
+    """Add a protein complex with its components.
+
+    Components are specified using a pipe-delimited format:
+    entity_id|label=X|evidence=Y|ref=Z
+
+    Examples:
+        # Simple components (just entity IDs)
+        --component UniProtKB:P12345 --component UniProtKB:P67890
+
+        # With labels
+        --component "UniProtKB:P12345|label=Ras protein"
+
+        # With evidence
+        --component "UniProtKB:P12345|label=Ras|evidence=ECO:0000314|ref=PMID:12345"
+    """
+    model = _normalize_model_id(model)
+
+    # Parse component specifications
+    components = []
+    for spec in component:
+        parsed = _parse_component_spec(spec)
+        components.append(ProteinComplexComponent(
+            entity_id=parsed["entity_id"],  # type: ignore[arg-type]
+            label=parsed["label"],
+            evidence_type=parsed["evidence_type"],
+            reference=parsed["reference"]
+        ))
+
+    if dry_run:
+        typer.echo(f"Would create protein complex in model {model}")
+        typer.echo(f"Complex class: {complex_class}")
+        typer.echo(f"Variable: {assign_var}")
+        typer.echo(f"Components ({len(components)}):")
+        for i, comp in enumerate(components, 1):
+            typer.echo(f"  {i}. {comp.entity_id}")
+            if comp.label:
+                typer.echo(f"     Label: {comp.label}")
+            if comp.evidence_type:
+                typer.echo(f"     Evidence: {comp.evidence_type}")
+            if comp.reference:
+                typer.echo(f"     Reference: {comp.reference}")
+        raise typer.Exit(code=0)
+
+    client = _make_client(token, base_url, namespace, provided_by, live)
+
+    typer.echo(f"Creating protein complex with {len(components)} component(s)...", err=True)
+    resp = client.add_protein_complex(
+        model,
+        components,
+        complex_class=complex_class,
+        assign_var=assign_var,
+        expected_label=expected_label
+    )
+
+    if resp.ok:
+        typer.echo("✓ Successfully created protein complex", err=True)
+
+        # Save to session if requested
+        if session:
+            session_mgr = SessionManager()
+            session_mgr.set_variable(session, model, assign_var, "<created-complex>")
+            typer.echo(f"✓ Saved variable '{assign_var}' to session '{session}'", err=True)
+
+        typer.echo(json.dumps(resp.raw, indent=2))
+    else:
+        typer.echo("✗ Failed to create protein complex", err=True)
+        typer.echo(json.dumps(resp.raw, indent=2), err=True)
+        raise typer.Exit(code=1)
+
+
+@barista_app.command("add-entity-set")
+def add_entity_set(
+    model: str = typer.Option(..., "-m", "--model", help="Target model id (e.g., gomodel:6796b94c00003233)"),
+    member: List[str] = typer.Option(..., "--member", help="Member spec: entity_id|label=X|evidence=Y|ref=Z (can be repeated)"),
+    set_class: str = typer.Option("CHEBI:33695", "--class", help="Set class CURIE (default: CHEBI:33695 information biomacromolecule)"),
+    assign_var: str = typer.Option("set1", "--var", help="Variable name for the set"),
+    expected_label: Optional[str] = typer.Option(None, "--expected-label", help="Expected label for validation"),
+    session: Optional[str] = typer.Option(None, "-S", "--session", help="Session name for saving variables"),
+    token: Optional[str] = typer.Option(None, envvar=BARISTA_TOKEN_ENV),
+    base_url: Optional[str] = typer.Option(None),
+    namespace: Optional[str] = typer.Option(None),
+    provided_by: Optional[str] = typer.Option(None),
+    dry_run: bool = typer.Option(False, "-n", "--dry-run"),
+    live: bool = typer.Option(False, "-L", "--live", help="Use production server instead of dev server"),
+):
+    """Add an entity set with functionally interchangeable members (e.g., paralogy groups).
+
+    Members are specified using a pipe-delimited format:
+    entity_id|label=X|evidence=Y|ref=Z
+
+    Examples:
+        # Simple members (just entity IDs)
+        --member UniProtKB:P27361 --member UniProtKB:P28482
+
+        # With labels (e.g., ERK paralogs)
+        --member "UniProtKB:P27361|label=MAPK3 (ERK1)" --member "UniProtKB:P28482|label=MAPK1 (ERK2)"
+
+        # With evidence
+        --member "UniProtKB:P27361|label=ERK1|evidence=ECO:0000314|ref=PMID:12345"
+    """
+    model = _normalize_model_id(model)
+
+    # Parse member specifications
+    members = []
+    for spec in member:
+        parsed = _parse_component_spec(spec)
+        members.append(EntitySetMember(
+            entity_id=parsed["entity_id"],  # type: ignore[arg-type]
+            label=parsed["label"],
+            evidence_type=parsed["evidence_type"],
+            reference=parsed["reference"]
+        ))
+
+    if dry_run:
+        typer.echo(f"Would create entity set in model {model}")
+        typer.echo(f"Set class: {set_class}")
+        typer.echo(f"Variable: {assign_var}")
+        typer.echo(f"Members ({len(members)}):")
+        for i, mem in enumerate(members, 1):
+            typer.echo(f"  {i}. {mem.entity_id}")
+            if mem.label:
+                typer.echo(f"     Label: {mem.label}")
+            if mem.evidence_type:
+                typer.echo(f"     Evidence: {mem.evidence_type}")
+            if mem.reference:
+                typer.echo(f"     Reference: {mem.reference}")
+        raise typer.Exit(code=0)
+
+    client = _make_client(token, base_url, namespace, provided_by, live)
+
+    typer.echo(f"Creating entity set with {len(members)} member(s)...", err=True)
+    resp = client.add_entity_set(
+        model,
+        members,
+        set_class=set_class,
+        assign_var=assign_var,
+        expected_label=expected_label
+    )
+
+    if resp.ok:
+        typer.echo("✓ Successfully created entity set", err=True)
+
+        # Save to session if requested
+        if session:
+            session_mgr = SessionManager()
+            session_mgr.set_variable(session, model, assign_var, "<created-set>")
+            typer.echo(f"✓ Saved variable '{assign_var}' to session '{session}'", err=True)
+
+        typer.echo(json.dumps(resp.raw, indent=2))
+    else:
+        typer.echo("✗ Failed to create entity set", err=True)
+        typer.echo(json.dumps(resp.raw, indent=2), err=True)
+        raise typer.Exit(code=1)
 
 
 # Amigo commands
