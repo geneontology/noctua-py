@@ -673,7 +673,22 @@ class BaristaClient:
         requests: Sequence[MinervaRequest],
         privileged: bool
     ) -> BaristaResponse:
-        """Execute requests as a simple batch - no validation, no rollback."""
+        """Execute requests as a simple batch - no validation, no rollback.
+
+        Variable tracking still runs for AddIndividual requests with
+        assign_to_variable, so that subsequent add_fact calls can
+        resolve variable names to actual IDs.
+        """
+        # Snapshot model state before execution for variable tracking
+        model_id = self._extract_model_id(requests)
+        before_state: Dict[str, Any] = {}
+        has_variable_assignment = self.track_variables and any(
+            isinstance(req, AddIndividualRequest) and req.arguments.assign_to_variable
+            for req in requests
+        )
+        if has_variable_assignment and model_id:
+            before_state = self._snapshot_model(model_id)
+
         dict_requests = [req.model_dump(by_alias=True, exclude_none=True) for req in requests]
 
         url = self.privileged_url if privileged else self.batch_url
@@ -686,8 +701,16 @@ class BaristaClient:
         resp = self._client.post(url, data=data)
         resp.raise_for_status()
         raw = resp.json()
+        response = BaristaResponse(raw=raw)
 
-        return BaristaResponse(raw=raw)
+        # Track variables for AddIndividual requests
+        if has_variable_assignment and model_id and response.ok:
+            after_state = response.raw.get("data", {})
+            for req in requests:
+                if isinstance(req, AddIndividualRequest) and req.arguments.assign_to_variable:
+                    self._track_variable_for_request(req, before_state, after_state)
+
+        return response
 
     def _track_variable_for_request(
         self,
