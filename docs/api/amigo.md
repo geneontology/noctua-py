@@ -21,12 +21,10 @@ AmigoClient(
 ```
 
 **Parameters:**
-- `base_url`: GOlr endpoint URL. If None, tries default endpoints automatically
+- `base_url`: GOlr endpoint URL. If None, uses the default endpoint
 - `timeout`: HTTP request timeout in seconds
 
-**Default Endpoints (tried in order):**
-- `http://golr-aux.geneontology.io/solr`
-- `http://golr.berkeleybop.org`
+**Default Endpoint:**
 - `https://golr.geneontology.org/solr`
 
 ### Bioentity Query Methods
