@@ -12,8 +12,6 @@ import httpx
 
 # Default GOlr endpoints (in order of preference)
 DEFAULT_GOLR_ENDPOINTS = [
-    "http://golr-aux.geneontology.io/solr",
-    "http://golr.berkeleybop.org",
     "https://golr.geneontology.org/solr"
 ]
 

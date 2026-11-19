@@ -48,30 +48,35 @@ class TestAmigoClient:
         assert client.base_url == "http://test.endpoint"
         assert client.timeout == 60.0
 
+    def test_client_initialization_uses_default_endpoint(self, mock_httpx_client):
+        """Test client uses the default endpoint when none provided."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "responseHeader": {"status": 0}
+        }
+        mock_httpx_client.get.return_value = mock_response
+
+        client = AmigoClient()  # No base_url provided
+        assert client.base_url == "https://golr.geneontology.org/solr"
+
     def test_client_initialization_finds_working_endpoint(self, mock_httpx_client):
-        """Test client finds working endpoint from defaults when none provided."""
-        # First endpoint fails, second succeeds
-        mock_responses = [
-            AmigoError("Connection failed"),
-            MagicMock()
-        ]
-        mock_responses[1].json.return_value = {
+        """Test client skips a failing default endpoint and uses the next one."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
             "responseHeader": {"status": 0}
         }
 
         def side_effect(*args, **kwargs):
-            if "golr-aux" in args[0]:
+            if "first.endpoint" in args[0]:
                 raise Exception("Connection failed")
-            return mock_responses[1]
+            return mock_response
 
         mock_httpx_client.get.side_effect = side_effect
 
-        client = AmigoClient()  # No base_url provided
-        assert client.base_url in [
-            "http://golr-aux.geneontology.io/solr",
-            "http://golr.berkeleybop.org",
-            "https://golr.geneontology.org/solr"
-        ]
+        endpoints = ["http://first.endpoint/solr", "http://second.endpoint/solr"]
+        with patch("noctua.amigo.DEFAULT_GOLR_ENDPOINTS", endpoints):
+            client = AmigoClient()  # No base_url provided
+        assert client.base_url == "http://second.endpoint/solr"
 
     def test_search_bioentities(self, amigo_client, mock_httpx_client):
         """Test searching for bioentities."""
